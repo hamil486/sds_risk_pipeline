@@ -12,30 +12,6 @@ The project integrates molecular diagnostics, mixed-effects modeling, multivaria
 
 ---
 
-## Repository Structure
-
-```text
-project/
-├── data/
-├── figures/
-├── output/
-├── scripts/
-├── sds_risk_ms_pipeline_clean_annotated_bells_whistles.Rmd
-├── README.md
-└── .gitignore
-```
-
-### Directory Descriptions
-
-| Folder | Description |
-|---|---|
-| `data/` | Raw and processed datasets used for analysis |
-| `figures/` | Exported manuscript-quality figures |
-| `output/` | Intermediate model outputs and tables |
-| `scripts/` | Optional helper scripts and utilities |
-
----
-
 ## Main Pipeline
 
 The primary workflow is contained in:
