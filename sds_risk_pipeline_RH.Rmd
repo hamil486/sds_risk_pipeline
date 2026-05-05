@@ -1,0 +1,6529 @@
+---
+title: "SDS Risk Manuscript Analysis Pipeline"
+author: "Ryan Hamilton"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Quick start and run order
+
+This annotated R Markdown file preserves the working manuscript analysis while making the pipeline easier to audit, rerun, and share on GitHub. The analysis is intentionally kept in one file so manuscript outputs can be traced from data import through models, figures, and supplemental tables.
+
+**Expected repository layout**
+
+```text
+.
+├── data/                 # Input data; not committed if restricted
+├── figures/              # Exported manuscript figures
+├── tables/               # Exported manuscript and supplemental tables
+├── cache/                # Optional cached model objects
+└── sds_risk_ms_pipeline_clean_annotated.Rmd
+```
+
+**Run order**
+
+1. Setup paths, packages, helper functions, and output directories.
+2. Import the 2020 to 2024 multistate SDS dataset and perform basic audits.
+3. Generate Figure 1 from the separate mapping coordinate file.
+4. Recode variables and build analysis-ready model datasets.
+5. Evaluate assumptions and fit root disease, foliar disease, yield, and decision-window mixed models.
+6. Generate correlation, association-network, PCA, and response-surface outputs.
+7. Summarize ROI and decision-window results for Figure 5 and Supplemental Table S3.
+8. Export manuscript figures and supplemental tables.
+9. Record session information for reproducibility.
+
+**Object naming guide**
+
+- `df_raw`: imported and minimally filtered dataset.
+- `df`: cleaned manuscript analysis dataset.
+- `df_*`: analysis-specific datasets.
+- `m_*`: fitted model objects.
+- `emm_*`: estimated marginal means.
+- `pairs_*`: pairwise contrast tables.
+- `*_export`: final manuscript or supplemental table objects.
+
+**Manuscript output map**
+
+- Figure 1: trial-location map and site-year bubble summary.
+- Figure 5: predicted yield response across pre-plant SDS risk levels.
+- Table S1: cultivar deployment by state/province and year.
+- Table S3: predicted yield and ROI across representative SDS risk levels.
+
+
+```{r setup, include=FALSE}
+# ============================================================
+# Global knitr options and project paths
+# ============================================================
+# Cleaned, annotated version of the working manuscript pipeline.
+# This file preserves the analytical workflow from the working Rmd and adds
+# a GitHub-oriented structure for paths, outputs, and documentation.
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+options(scipen = 999)
+
+# ---- User-editable paths ----
+# Place input data in ./data/ for GitHub use, or edit locally.
+data_path <- "data/full2020_2024.csv"
+map_path  <- "data/map.csv"
+
+# ---- Output directories ----
+fig_dir   <- "figures"
+table_dir <- "tables"
+cache_dir <- "cache"
+
+for (d in c(fig_dir, table_dir, cache_dir)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+# ---- Lightweight helper functions ----
+# These wrappers make export calls consistent and keep manuscript outputs in
+# predictable folders. They are intentionally simple so the Rmd remains easy to
+# run on a collaborator's machine.
+export_plot <- function(plot, filename, width, height, dpi = 600, ...) {
+  ggplot2::ggsave(
+    filename = file.path(fig_dir, filename),
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = dpi,
+    ...
+  )
+}
+
+export_table <- function(x, filename) {
+  readr::write_csv(x, file.path(table_dir, filename))
+}
+
+standardize_product <- function(x) {
+  dplyr::case_when(
+    stringr::str_detect(as.character(x), stringr::regex("base|CB$", ignore_case = TRUE)) ~ "Base",
+    stringr::str_detect(as.character(x), stringr::regex("ILEVO|fluopyram", ignore_case = TRUE)) ~ "ILEVO",
+    stringr::str_detect(as.character(x), stringr::regex("Saltro|pydiflumetofen", ignore_case = TRUE)) ~ "Saltro",
+    TRUE ~ as.character(x)
+  )
+}
+
+standardize_sds_tol <- function(x) {
+  dplyr::case_when(
+    as.character(x) %in% c("r", "R") ~ "Moderately resistant",
+    as.character(x) %in% c("s", "S") ~ "Susceptible",
+    TRUE ~ as.character(x)
+  )
+}
+
+getwd()
+```
+
+# ============================================================
+# Multistate SDS risk manuscript pipeline
+# Working dataset: full2020_2024.csv
+# ============================================================
+### Start clean
+```{r clean-session, include=FALSE, results='hide', eval=FALSE}
+# Optional interactive cleanup. This chunk is disabled by default for GitHub
+# reproducibility because clearing the environment after setup removes path and
+# helper objects defined above. Run manually only if needed.
+rm(list = ls(all = TRUE))
+```
+
+# -----------------------------
+# 0. Packages
+# -----------------------------
+```{r packages, warning=FALSE, include=FALSE}
+# install_missing is FALSE by default for GitHub/reproducibility hygiene.
+# Set to TRUE if running on a fresh local machine and you want auto-install.
+install_missing <- FALSE
+req_pkgs <- c(
+  "tidyverse",
+  "janitor",
+  "readr",
+  "stringr",
+  "forcats",
+  "lme4",
+  "lmerTest",
+  "emmeans",
+  "multcomp",
+  "multcompView",
+  "performance",
+  "DHARMa",
+  "broom.mixed",
+  "rstatix",
+  "MASS",
+  "car",
+  "FactoMineR",
+  "factoextra",
+  "corrplot",
+  "polycor",
+  "DescTools",
+  "igraph",
+  "tidygraph",
+  "ggraph",
+  "scales",
+  "patchwork",
+  "mgcv"
+)
+
+# Packages used by the mapping and table-formatting sections.
+req_pkgs <- unique(c(req_pkgs, "maps", "tidyr"))
+
+to_install <- req_pkgs[!req_pkgs %in% installed.packages()[, "Package"]]
+if (install_missing && length(to_install) > 0) {
+  install.packages(to_install, dependencies = TRUE)
+}
+
+invisible(lapply(req_pkgs, library, character.only = TRUE))
+
+```
+
+# -----------------------------
+# 1. Import and basic audit
+# -----------------------------
+```{r include=FALSE}
+df_raw <- read_csv(data_path, show_col_types = FALSE) %>%
+  janitor::clean_names() %>%
+  filter(product %in% c("Base", "ILEVO", "Saltro")) %>%
+  filter(!stringr::str_detect(location, "HEADSUP")) %>%
+  mutate(
+    location = stringr::str_remove(location, "_[0-9]+$")
+  )
+
+glimpse(df_raw)
+dim(df_raw)
+names(df_raw)
+
+missing_tbl <- tibble(
+  variable = names(df_raw),
+  n_missing = sapply(df_raw, \(x) sum(is.na(x))),
+  pct_missing = round(100 * n_missing / nrow(df_raw), 2)
+) %>%
+  arrange(desc(n_missing))
+
+print(missing_tbl, n = nrow(missing_tbl))
+
+state_counts <- df_raw %>% dplyr::count(state, sort = TRUE)
+year_counts  <- df_raw %>% dplyr::count(year, sort = TRUE)
+
+print(state_counts)
+print(year_counts)
+
+
+```
+
+# -----------------------------
+# 1A. Required-column validation
+# -----------------------------
+```{r required-column-validation}
+# Fail early if a required manuscript variable is missing. This is especially
+# helpful when collaborators rerun the pipeline with a revised flat file.
+required_cols <- c(
+  "state", "location", "year", "exp", "rep", "cultivar", "sds_tol",
+  "product", "ratio_fvfg_dnang", "soil_ph", "scn_count_rep",
+  "rdx", "fdx", "yield_kgha", "plant_date", "seed_rate_ha", "row_space_m"
+)
+
+missing_required <- setdiff(required_cols, names(df_raw))
+if (length(missing_required) > 0) {
+  stop(
+    "Required columns are missing from df_raw: ",
+    paste(missing_required, collapse = ", ")
+  )
+}
+
+message("Required-column check passed: ", length(required_cols), " expected fields found.")
+```
+
+# -----------------------------
+# 1B. Figure 1 mapping workflow
+# -----------------------------
+```{r figure-1-map, eval=FALSE}
+# Purpose:
+#   Generate the manuscript Figure 1 map showing field trial locations and the
+#   number of site-years represented at each location. This block uses a separate
+#   flat file (map.csv) containing latitude and longitude for each location.
+#
+# Required columns in map.csv:
+#   state, location, year, lat, lon
+#
+# The chunk is eval=FALSE by default because map coordinates are maintained in a
+# separate file and may not be distributed with restricted analysis data.
+
+library(maps)
+library(patchwork)
+
+# ---- Read mapping file ----
+df_map <- readr::read_csv(map_path, show_col_types = FALSE) %>%
+  mutate(
+    state = trimws(as.character(state)),
+    location = trimws(as.character(location)),
+    region_panel = case_when(
+      state == "ON" ~ "Ontario",
+      state == "DE" ~ "Delaware",
+      state %in% c("MI", "IL", "IN", "OH", "WI", "IA", "MO", "KS", "KY", "ND", "NE") ~ "North Central U.S.",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(region_panel != "Other")
+
+# ---- Count site-years per unique location ----
+# Site-years are defined as unique location × year combinations. This is the
+# quantity encoded by bubble size in Figure 1.
+df_counts <- df_map %>%
+  group_by(region_panel, state, location) %>%
+  summarise(
+    site_years = n_distinct(year),
+    lat = first(lat),
+    lon = first(lon),
+    .groups = "drop"
+  )
+
+# ---- Basemap data ----
+us_map <- map_data("state")
+can_map <- map_data("world") %>%
+  filter(region == "Canada")
+
+# ---- Shared map style ----
+map_theme <- theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    plot.margin = margin(t = 0, r = 2, b = 0, l = 4),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey85", linewidth = 0.2),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 9),
+    axis.ticks = element_line(linewidth = 0.2),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+  )
+
+siteyear_limits <- range(df_counts$site_years, na.rm = TRUE)
+size_breaks <- sort(unique(df_counts$site_years))
+
+# ---- North Central U.S. panel ----
+p_midwest <- ggplot() +
+  geom_polygon(
+    data = us_map,
+    aes(x = long, y = lat, group = group),
+    fill = "grey92",
+    color = "grey40",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    data = df_counts %>% filter(region_panel == "North Central U.S."),
+    aes(x = lon, y = lat, size = site_years),
+    shape = 21,
+    fill = "grey60",
+    color = "black",
+    alpha = 0.7,
+    stroke = 0.3
+  ) +
+  coord_quickmap(xlim = c(-100, -80.1), ylim = c(36, 49)) +
+  scale_size_continuous(
+    range = c(2.5, 8),
+    limits = siteyear_limits,
+    breaks = size_breaks,
+    name = "Site-years",
+    guide = "legend"
+  ) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  labs(title = "North Central U.S.A.", x = "Longitude", y = "Latitude") +
+  map_theme +
+  theme(plot.title = element_text(face = "bold", hjust = 0, vjust = -7, margin = margin(b = 0)))
+
+# ---- Ontario panel ----
+p_ontario <- ggplot() +
+  geom_polygon(
+    data = can_map,
+    aes(x = long, y = lat, group = group),
+    fill = "grey92",
+    color = "grey40",
+    linewidth = 0.25
+  ) +
+  geom_polygon(
+    data = us_map,
+    aes(x = long, y = lat, group = group),
+    fill = "grey92",
+    color = "grey40",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    data = df_counts %>% filter(region_panel == "Ontario"),
+    aes(x = lon, y = lat, size = site_years),
+    shape = 21,
+    fill = "grey60",
+    color = "black",
+    alpha = 0.7,
+    stroke = 0.3
+  ) +
+  coord_quickmap(xlim = c(-84.75, -80), ylim = c(40.75, 44.25)) +
+  scale_size_continuous(
+    range = c(2.5, 8),
+    limits = siteyear_limits,
+    breaks = size_breaks,
+    name = "Site-years",
+    guide = "none"
+  ) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  labs(title = "Ontario, Canada", x = "Longitude", y = "Latitude") +
+  map_theme +
+  theme(plot.title = element_text(face = "bold", hjust = 0, vjust = -8, margin = margin(l = 4)))
+
+# ---- Delaware panel ----
+p_delaware <- ggplot() +
+  geom_polygon(
+    data = us_map,
+    aes(x = long, y = lat, group = group),
+    fill = "grey92",
+    color = "grey40",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    data = df_counts %>% filter(region_panel == "Delaware"),
+    aes(x = lon, y = lat, size = site_years),
+    shape = 21,
+    fill = "grey60",
+    color = "black",
+    alpha = 0.7,
+    stroke = 0.3
+  ) +
+  coord_quickmap(xlim = c(-76.5, -75), ylim = c(38.25, 40)) +
+  scale_size_continuous(
+    range = c(2.5, 8),
+    limits = siteyear_limits,
+    breaks = size_breaks,
+    name = "Site-years",
+    guide = "none"
+  ) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  labs(title = "Delaware, U.S.A.", x = "Longitude", y = "Latitude") +
+  map_theme +
+  theme(plot.title = element_text(face = "bold", hjust = 0, vjust = -6, margin = margin(l = 6)))
+
+# ---- Assemble panels ----
+right_panels <- p_ontario / patchwork::plot_spacer() / p_delaware +
+  plot_layout(heights = c(1, 0.03, 1.25))
+
+p_map <- (p_midwest | patchwork::plot_spacer() | right_panels) +
+  plot_layout(widths = c(2.5, 0.12, 0.75), guides = "collect") &
+  theme(
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.justification = "center",
+    plot.margin = margin(0, 2.5, 0, 2.5)
+  )
+
+p_map
+
+ggsave(
+  file.path(fig_dir, "Figure_1_trial_locations.png"),
+  p_map,
+  width = 9,
+  height = 6,
+  dpi = 600
+)
+```
+# -----------------------------
+# 2. Preprocess / recode
+# -----------------------------
+```{r}
+df <- df_raw %>%
+  mutate(
+    # Factors
+    state    = as.factor(state),
+    location = as.factor(location),
+    year     = as.factor(year),
+    exp      = as.factor(exp),
+    rep      = as.factor(rep),
+    cultivar = as.factor(cultivar),
+    product  = as.factor(product),
+    sds_tol  = as.factor(sds_tol),
+
+    # Hierarchical helpers
+    siteyear = factor(paste(location, year, sep = "_")),
+    
+    # Numeric coercion
+    ratio_fvfg_dnang = as.numeric(ratio_fvfg_dnang),
+    scn_count_rep    = as.numeric(scn_count_rep),
+    soil_p_h         = as.numeric(soil_ph),
+    fdx              = as.numeric(fdx),
+    rdx              = as.numeric(rdx),
+    drw              = as.numeric(drw),
+    pl_pop_ha        = as.numeric(pl_pop_ha),
+    yield_kgha       = as.numeric(yield_kgha),
+    proj_price_kg    = as.numeric(proj_price_kg),
+    harv_price_kg    = as.numeric(harv_price_kg),
+    volatility       = as.numeric(volatility),
+
+    # Transformations for LMM fitting
+    log10_fv   = log10(ratio_fvfg_dnang + 0.001),
+    log10_scn  = log10(scn_count_rep + 1),
+    log1p_fdx  = log1p(fdx),
+    log1p_rdx  = log1p(rdx),
+    log1p_drw  = log1p(drw),
+
+    # Disease category
+    fdx_level = case_when(
+      is.na(fdx)            ~ NA_character_,
+      fdx == 0              ~ "none",
+      fdx > 0 & fdx < 10    ~ "low",
+      fdx >= 10             ~ "high"
+    ) %>% factor(levels = c("none", "low", "high")),
+
+    # SCN category
+    scn_level = case_when(
+      is.na(scn_count_rep)  ~ NA_character_,
+      scn_count_rep == 0    ~ "none",
+      scn_count_rep < 2000  ~ "low",
+      scn_count_rep >= 2000 ~ "high"
+    ) %>% factor(levels = c("none", "low", "high")),
+
+    # Condensed neutral Fv bins for plotting / trees
+    fv_level_simple = case_when(
+      is.na(ratio_fvfg_dnang)                     ~ NA_character_,
+      ratio_fvfg_dnang == 0                       ~ "0",
+      ratio_fvfg_dnang > 0 & ratio_fvfg_dnang < 1 ~ "0-1",
+      ratio_fvfg_dnang >= 1 & ratio_fvfg_dnang < 5  ~ "1-4",
+      ratio_fvfg_dnang >= 5                         ~ ">5"
+    ) %>% factor(levels = c("0", "0-1", "1-4", ">5"))
+  )
+
+summary(df %>% select(ratio_fvfg_dnang, scn_count_rep, soil_ph, fdx, yield_kgha))
+table(df$fdx_level, useNA = "ifany")
+table(df$scn_level, useNA = "ifany")
+table(df$fv_level_simple, useNA = "ifany")
+
+```
+# -----------------------------
+# 3. Exploratory plots
+# -----------------------------
+```{r warning=FALSE}
+p_hist_fv <- ggplot(df, aes(x = ratio_fvfg_dnang)) +
+  geom_histogram(bins = 40) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "F. virguliforme DNA abundance", x = "fg Fv DNA / ng total eDNA", y = "Count")
+
+p_hist_scn <- ggplot(df, aes(x = scn_count_rep)) +
+  geom_histogram(bins = 40) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "SCN abundance", x = "SCN eggs + J2 / 100 cm^3", y = "Count")
+
+p_hist_fdx <- ggplot(df, aes(x = fdx)) +
+  geom_histogram(bins = 40) +
+  labs(title = "FDX distribution", x = "FDX", y = "Count")
+
+p_hist_yield <- ggplot(df, aes(x = yield_kgha)) +
+  geom_histogram(bins = 40) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "Yield distribution", x = "Yield (kg/ha)", y = "Count")
+
+(p_hist_fv | p_hist_scn) / (p_hist_fdx | p_hist_yield)
+
+ggsave("exploratory_histograms.png", width = 12, height = 8, dpi = 300)
+
+```
+
+# -----------------------------
+# 4. Core analysis datasets
+# -----------------------------
+```{r}
+df_fdx <- df %>%
+  filter(
+    !is.na(fdx),
+    !is.na(log10_fv),
+    !is.na(log10_scn),
+    !is.na(product),
+    !is.na(sds_tol)
+  )
+
+df_yield <- df %>%
+  filter(
+    !is.na(yield_kgha),
+    !is.na(log10_fv),
+    !is.na(log10_scn),
+    !is.na(product),
+    !is.na(sds_tol)
+  )
+
+df_fdx_ph <- df_fdx %>% filter(!is.na(soil_ph))
+df_yield_ph <- df_yield %>% filter(!is.na(soil_ph))
+
+```
+
+### Sanity check ###
+```{r}
+glimpse(df)
+
+summary(df %>%
+  select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    yield_kgha
+  ))
+
+df %>% 
+  dplyr::count(siteyear) %>% 
+  arrange(desc(n))
+
+df %>%
+  dplyr::count(siteyear, product) %>%
+  pivot_wider(names_from = product, values_from = n)
+```
+# -----------------------------
+# 4B. Root subset datasets and diagnostics
+# -----------------------------
+```{r}
+df_root <- df %>%
+  filter(
+    !is.na(rdx),
+    !is.na(drw),
+    !is.na(log10_fv),
+    !is.na(log10_scn),
+    !is.na(product),
+    !is.na(sds_tol)
+  )
+
+df_root_ph <- df_root %>%
+  filter(!is.na(soil_ph))
+
+cat("\n================ Root subset overview ================\n")
+print(
+  df_root %>%
+    summarise(
+      n_obs = n(),
+      n_siteyear = n_distinct(siteyear),
+      n_location = n_distinct(location),
+      n_year = n_distinct(year)
+    )
+)
+
+cat("\nObservations by product in root subset:\n")
+print(df_root %>% dplyr::count(product, sort = TRUE))
+
+cat("\nObservations by SDS tolerance in root subset:\n")
+print(df_root %>% dplyr::count(sds_tol, sort = TRUE))
+
+cat("\nObservations by siteyear in root subset:\n")
+print(df_root %>% dplyr::count(siteyear, sort = TRUE))
+
+# Quick summaries
+cat("\n================ Root subset summaries ================\n")
+print(summary(df_root %>% select(rdx, drw, ratio_fvfg_dnang, scn_count_rep, fdx, yield_kgha)))
+
+# Histograms
+p_hist_rdx <- ggplot(df_root, aes(x = rdx)) +
+  geom_histogram(bins = 40) +
+  labs(title = "RDX distribution", x = "Root disease index (RDX)", y = "Count")
+
+p_hist_drw <- ggplot(df_root, aes(x = drw)) +
+  geom_histogram(bins = 40) +
+  labs(title = "DRW distribution", x = "Dry root weight (DRW)", y = "Count")
+
+p_hist_rdx_log <- ggplot(df_root, aes(x = log1p_rdx)) +
+  geom_histogram(bins = 40) +
+  labs(title = "log1p(RDX) distribution", x = "log1p(RDX)", y = "Count")
+
+p_hist_drw_log <- ggplot(df_root, aes(x = log1p_drw)) +
+  geom_histogram(bins = 40) +
+  labs(title = "log1p(DRW) distribution", x = "log1p(DRW)", y = "Count")
+
+(p_hist_rdx | p_hist_drw) / (p_hist_rdx_log | p_hist_drw_log)
+
+ggsave("exploratory_root_histograms.png", width = 12, height = 8, dpi = 300)
+
+# -----------------------------
+# Root subset assumption testing
+# -----------------------------
+cat("\n================ Root subset Levene's tests ================\n")
+print(car::leveneTest(rdx ~ product, data = df_root))
+print(car::leveneTest(drw ~ product, data = df_root))
+print(car::leveneTest(rdx ~ sds_tol, data = df_root))
+print(car::leveneTest(drw ~ sds_tol, data = df_root))
+
+# Reuse safe_shapiro if already defined above; if not, define here
+safe_shapiro <- function(x, label = "variable") {
+  x <- x[!is.na(x)]
+  if (length(x) > 5000) {
+    set.seed(123)
+    x <- sample(x, 5000)
+  }
+  out <- shapiro.test(x)
+  cat("\nShapiro-Wilk test for", label, "\n")
+  print(out)
+}
+
+safe_shapiro(df_root$rdx, "rdx (raw)")
+safe_shapiro(df_root$log1p_rdx, "rdx (log1p)")
+safe_shapiro(df_root$drw, "drw (raw)")
+safe_shapiro(df_root$log1p_drw, "drw (log1p)")
+
+# Box-Cox on positive values only
+cat("\n================ Root subset Box-Cox tests ================\n")
+
+df_rdx_pos <- df_root %>% filter(rdx > 0)
+if (nrow(df_rdx_pos) > 20) {
+  bc_rdx <- MASS::boxcox(
+    lm(rdx ~ log10_fv + log10_scn + product + sds_tol, data = df_rdx_pos),
+    plotit = FALSE
+  )
+  lambda_rdx <- bc_rdx$x[which.max(bc_rdx$y)]
+  cat("Estimated Box-Cox lambda for positive RDX:", lambda_rdx, "\n")
+} else {
+  lambda_rdx <- NA_real_
+  cat("Not enough positive RDX values for Box-Cox estimation.\n")
+}
+
+df_drw_pos <- df_root %>% filter(drw > 0)
+if (nrow(df_drw_pos) > 20) {
+  bc_drw <- MASS::boxcox(
+    lm(drw ~ log10_fv + log10_scn + product + sds_tol, data = df_drw_pos),
+    plotit = FALSE
+  )
+  lambda_drw <- bc_drw$x[which.max(bc_drw$y)]
+  cat("Estimated Box-Cox lambda for positive DRW:", lambda_drw, "\n")
+} else {
+  lambda_drw <- NA_real_
+  cat("Not enough positive DRW values for Box-Cox estimation.\n")
+}
+
+# Simple biological relationships for later mechanistic interpretation
+cat("\n================ Root subset simple correlations ================\n")
+print(cor.test(df_root$rdx, df_root$fdx, method = "spearman", use = "pairwise.complete.obs"))
+print(cor.test(df_root$rdx, df_root$yield_kgha, method = "spearman", use = "pairwise.complete.obs"))
+print(cor.test(df_root$drw, df_root$fdx, method = "spearman", use = "pairwise.complete.obs"))
+print(cor.test(df_root$drw, df_root$yield_kgha, method = "spearman", use = "pairwise.complete.obs"))
+
+# Quick exploratory plots
+p_rdx_fdx <- ggplot(df_root, aes(x = rdx, y = fdx)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "RDX vs FDX", x = "RDX", y = "FDX")
+
+p_rdx_yield <- ggplot(df_root, aes(x = rdx, y = yield_kgha)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "RDX vs yield", x = "RDX", y = "Yield (kg/ha)")
+
+p_drw_fdx <- ggplot(df_root, aes(x = drw, y = fdx)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "DRW vs FDX", x = "DRW", y = "FDX")
+
+p_drw_yield <- ggplot(df_root, aes(x = drw, y = yield_kgha)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "DRW vs yield", x = "DRW", y = "Yield (kg/ha)")
+
+(p_rdx_fdx | p_rdx_yield) / (p_drw_fdx | p_drw_yield)
+
+ggsave("exploratory_root_relationships.png", width = 12, height = 8, dpi = 300)
+
+df_root %>% dplyr::count(siteyear)
+write_csv(df, "full2020_2024_analysis_ready.csv")
+
+```
+
+# -----------------------------
+# 5. Formal assumption testing
+# -----------------------------
+```{r}
+# Levene's tests (homogeneity of variance)
+# These are most interpretable for grouped factors such as product and tolerance
+cat("\n================ Levene's tests ================\n")
+print(car::leveneTest(fdx ~ product, data = df_fdx))
+print(car::leveneTest(yield_kgha ~ product, data = df_yield))
+print(car::leveneTest(fdx ~ sds_tol, data = df_fdx))
+print(car::leveneTest(yield_kgha ~ sds_tol, data = df_yield))
+
+# Shapiro-Wilk tests
+# Run on raw and transformed responses; use a sample if n > 5000
+safe_shapiro <- function(x, label = "variable") {
+  x <- x[!is.na(x)]
+  if (length(x) > 5000) {
+    set.seed(123)
+    x <- sample(x, 5000)
+  }
+  out <- shapiro.test(x)
+  cat("\nShapiro-Wilk test for", label, "\n")
+  print(out)
+}
+
+safe_shapiro(df_fdx$fdx, "fdx (raw)")
+safe_shapiro(df_fdx$log1p_fdx, "fdx (log1p)")
+safe_shapiro(df_yield$yield_kgha, "yield_kgha (raw)")
+#safe_shapiro(df_yield$log_yield, "yield_kgha (log)")
+safe_shapiro(df_yield$yield_kgha, "yield_kgha (for Box-Cox reference)")
+
+# Box-Cox tests for yield
+# Box-Cox requires strictly positive response
+cat("\n================ Box-Cox tests ================\n")
+#bc_yield <- MASS::boxcox(
+  #lm(yield_kgha ~ log10_fv + log10_scn + product + sds_tol, data = df_yield),
+  #plotit = FALSE
+#)
+#lambda_yield <- bc_yield$x[which.max(bc_yield$y)]
+#cat("Estimated Box-Cox lambda for yield_kgha:", lambda_yield, "\n")
+
+# Apply Box-Cox transformed yield for modeling
+#if (abs(lambda_yield) < 1e-6) {
+ #df_yield <- df_yield %>% mutate(yield_bc = log(yield_kgha))
+#} else {
+ # df_yield <- df_yield %>%
+    #mutate(yield_bc = (yield_kgha^lambda_yield - 1) / lambda_yield)
+#}
+
+# Optional Box-Cox for positive disease subsets only
+df_fdx_pos <- df_fdx %>% filter(fdx > 0)
+if (nrow(df_fdx_pos) > 20) {
+  bc_fdx <- MASS::boxcox(
+    lm(fdx ~ log10_fv + log10_scn + product + sds_tol, data = df_fdx_pos),
+    plotit = FALSE
+  )
+  lambda_fdx <- bc_fdx$x[which.max(bc_fdx$y)]
+  cat("Estimated Box-Cox lambda for positive FDX:", lambda_fdx, "\n")
+} else {
+  lambda_fdx <- NA_real_
+  cat("Not enough positive FDX values for Box-Cox estimation.\n")
+}
+
+```
+
+# -----------------------------
+# 6. Linear mixed models
+# -----------------------------
+# Core model strategy:
+# - Use transformed response variables where diagnostics justify it
+# - Use Tukey HSD only for pairwise comparisons
+# - No BH / FDR adjustments in the inferential core
+
+# -------------------------------
+# 6a. RDX models - df_root subset
+# -------------------------------
+```{r}
+
+df_root_mod <- df_root %>%
+  mutate(
+    z_log10_fv   = as.numeric(scale(log10_fv)),
+    z_log10_scn  = as.numeric(scale(log10_scn)),
+    exp_siteyear = interaction(siteyear, exp, drop = TRUE)
+  )
+
+df_root_ph_mod <- df_root_ph %>%
+  mutate(
+    z_log10_fv   = as.numeric(scale(log10_fv)),
+    z_log10_scn  = as.numeric(scale(log10_scn)),
+    z_soil_ph    = as.numeric(scale(soil_ph)),
+    exp_siteyear = interaction(siteyear, exp, drop = TRUE)
+  )
+
+conflicts_prefer(lme4::lmer)
+
+# -----------------------------
+# RDX models
+# -----------------------------
+
+m_rdx_1 <- lmer(
+  log1p_rdx ~ z_log10_fv + z_log10_scn + sds_tol +
+    (1 | siteyear),
+  data = df_root_mod,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+cat("\n================ RDX model 1 ================\n")
+print(summary(m_rdx_1))
+print(emmeans::joint_tests(m_rdx_1))
+print(performance::check_singularity(m_rdx_1))
+print(performance::check_collinearity(m_rdx_1))
+
+# Optional pH model
+m_rdx_2 <- lmer(
+  log1p_rdx ~ z_log10_fv + z_log10_scn + z_soil_ph + sds_tol:product + (1 | siteyear),
+  data = df_root_ph_mod,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+cat("\n================ RDX model 2 (with pH) ================\n")
+print(summary(m_rdx_2))
+print(emmeans::joint_tests(m_rdx_2))
+print(performance::check_singularity(m_rdx_2))
+print(performance::check_collinearity(m_rdx_2))
+
+# EMMs for product from core model
+emm_rdx_product <- emmeans(m_rdx_2, ~ product, type = "response")
+multcomp::cld(emm_rdx_product)
+
+rdx_emm_bt <- as.data.frame(emm_rdx_product) %>%
+  dplyr::mutate(
+    emmean_bt   = exp(emmean) - 1,
+    lower.CL_bt = exp(lower.CL) - 1,
+    upper.CL_bt = exp(upper.CL) - 1
+  )
+
+rdx_emm_bt_fmt <- rdx_emm_bt %>%
+  dplyr::transmute(
+    product,
+    EMM_bt = round(emmean_bt, 2),
+    lower.CL_bt = round(lower.CL_bt, 2),
+    upper.CL_bt = round(upper.CL_bt, 2)
+  )
+
+
+# Refit no-pH model on same rows for valid AIC comparison
+m_rdx_1_same_rows <- lmer(
+  log1p_rdx ~ z_log10_fv +
+    (1 | siteyear),
+  data = df_root_ph_mod,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+cat("\n================ RDX AIC comparison on same rows ================\n")
+print(AIC(m_rdx_1_same_rows, m_rdx_2))
+
+# EMMs for product
+#emm_rdx_product <- emmeans(m_rdx_1, ~ product)
+
+#cat("\n================ RDX product EMMs ================\n")
+#print(emm_rdx_product)
+#print(pairs(emm_rdx_product, adjust = "tukey"))
+#print(cld(emm_rdx_product, Letters = letters, adjust = "tukey"))
+
+# Optional EMMs for sds_tol
+#emm_rdx_tol <- emmeans(m_rdx_1, ~ sds_tol)
+
+#cat("\n================ RDX sds_tol EMMs ================\n")
+#print(emm_rdx_tol)
+#print(pairs(emm_rdx_tol, adjust = "tukey"))
+#print(cld(emm_rdx_tol, Letters = letters, adjust = "tukey"))
+
+# -----------------------------
+# DRW models
+# -----------------------------
+
+#m_drw_1 <- lmer(
+  #log1p_drw ~ z_log10_fv + z_log10_scn + product + sds_tol +
+    #(1 | siteyear) + (1 | exp_siteyear),
+  # = df_root_mod,
+  # = FALSE,
+  # = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+#)
+
+#cat("\n================ DRW model 1 ================\n")
+#print(summary(m_drw_1))
+#print(emmeans::joint_tests(m_drw_1))
+#print(performance::check_singularity(m_drw_1))
+#print(performance::check_collinearity(m_drw_1))
+
+# Optional pH model
+#m_drw_2 <- lmer(
+  #log1p_drw ~ z_log10_fv + z_log10_scn + z_soil_ph + product + sds_tol +
+    #(1 | siteyear) + (1 | exp_siteyear),
+  #data = df_root_ph_mod,
+  #REML = FALSE,
+  #control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+#)
+
+#cat("\n================ DRW model 2 (with pH) ================\n")
+#print(summary(m_drw_2))
+#print(emmeans::joint_tests(m_drw_2))
+#print(performance::check_singularity(m_drw_2))
+#print(performance::check_collinearity(m_drw_2))
+
+# Refit no-pH model on same rows for valid AIC comparison
+#m_drw_1_same_rows <- lmer(
+  #log1p_drw ~ z_log10_fv + z_log10_scn + product + sds_tol +
+    #(1 | siteyear) + (1 | exp_siteyear),
+  #data = df_root_ph_mod,
+  #REML = FALSE,
+ ## control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+#)
+
+#cat("\n================ DRW AIC comparison on same rows ================\n")
+#print(AIC(m_drw_1_same_rows, m_drw_2))
+
+# EMMs for product
+#emm_drw_product <- emmeans(m_drw_1, ~ product)
+
+#cat("\n================ DRW product EMMs ================\n")
+#print(emm_drw_product)
+#print(pairs(emm_drw_product, adjust = "tukey"))
+#print(cld(emm_drw_product, Letters = letters, adjust = "tukey"))
+
+# Optional EMMs for sds_tol
+#emm_drw_tol <- emmeans(m_drw_1, ~ sds_tol)
+
+#cat("\n================ DRW sds_tol EMMs ================\n")
+#print(emm_drw_tol)
+#print(pairs(emm_drw_tol, adjust = "tukey"))
+#print(cld(emm_drw_tol, Letters = letters, adjust = "tukey"))
+```
+
+
+#-----------------------------
+# Theme (APS-style, consistent across figures)
+#-----------------------------
+```{r}
+
+theme_siteyear <- ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major = ggplot2::element_line(linewidth = 0.2),
+    #plot.title = ggplot2::element_blank(),
+    axis.title = ggplot2::element_text(color = "black"),
+    axis.text = ggplot2::element_text(color = "black"),
+    strip.text = ggplot2::element_text(color = "black"),
+    #legend.title = ggplot2::element_blank(),
+    legend.position = "right"
+  )
+```
+
+
+
+# ============================================================
+# 6b. Root subset downstream analyses -- 
+# Correlation, association matrix, mini-network, PCA
+# ============================================================
+# -----------------------------
+# 1. Root subset numeric correlations
+# -----------------------------
+```{r}
+root_num <- df_root %>%
+  select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    rdx,
+    drw,
+    fdx,
+    yield_kgha
+  )
+
+# Spearman correlation matrix
+root_cor <- cor(root_num, method = "spearman", use = "pairwise.complete.obs")
+print(root_cor)
+
+# Pairwise Spearman tests
+root_cor_tests <- expand.grid(
+  var1 = names(root_num),
+  var2 = names(root_num),
+  stringsAsFactors = FALSE
+) %>%
+  filter(var1 < var2) %>%
+  rowwise() %>%
+  mutate(
+    test = list(
+      suppressWarnings(
+        cor.test(
+          root_num[[var1]],
+          root_num[[var2]],
+          method = "spearman",
+          use = "pairwise.complete.obs"
+        )
+      )
+    ),
+    rho = unname(test$estimate),
+    p_value = test$p.value
+  ) %>%
+  ungroup() %>%
+  select(var1, var2, rho, p_value)
+
+cat("\n================ Root subset pairwise Spearman correlations ================\n")
+print(root_cor_tests)
+
+write_csv(root_cor_tests, "root_pairwise_spearman_correlations.csv")
+
+# Visualize numeric correlation matrix
+png("fig_root_numeric_correlation_matrix.png", width = 1600, height = 1400, res = 220)
+corrplot::corrplot(
+  root_cor,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.srt = 45,
+  addCoef.col = "black",
+  number.cex = 0.7,
+  mar = c(0, 0, 2, 0),
+  title = "Root subset numeric Spearman correlation matrix"
+)
+dev.off()
+
+```
+# -----------------------------
+# 2. Mixed-type association matrix for root subset
+# -----------------------------
+```{r}
+# Helper: normalize all result objects to the same shape
+safe_extract_result <- function(res) {
+  out <- c(estimate = NA_real_, p = NA_real_)
+
+  # NULL / empty
+  if (is.null(res) || length(res) == 0) {
+    return(out)
+  }
+
+  # Bare numeric scalar
+  if (is.numeric(res) && length(res) == 1 && is.null(names(res))) {
+    out["estimate"] <- as.numeric(res)
+    return(out)
+  }
+
+  # Named atomic vector
+  if (is.atomic(res) && !is.null(names(res))) {
+    if ("estimate" %in% names(res) && length(res[["estimate"]]) == 1) {
+      out["estimate"] <- suppressWarnings(as.numeric(res[["estimate"]]))
+    }
+    if ("p" %in% names(res) && length(res[["p"]]) == 1) {
+      out["p"] <- suppressWarnings(as.numeric(res[["p"]]))
+    }
+    return(out)
+  }
+
+  # List with named elements
+  if (is.list(res)) {
+    if (!is.null(res$estimate) && length(res$estimate) == 1) {
+      out["estimate"] <- suppressWarnings(as.numeric(res$estimate))
+    }
+    if (!is.null(res$p) && length(res$p) == 1) {
+      out["p"] <- suppressWarnings(as.numeric(res$p))
+    }
+    return(out)
+  }
+
+  out
+}
+
+safe_cor_test <- function(x, y, method = "pearson") {
+  ok <- stats::complete.cases(x, y)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  out <- tryCatch(
+    suppressWarnings(stats::cor.test(x[ok], y[ok], method = method)),
+    error = function(e) NULL
+  )
+
+  if (is.null(out)) return(c(estimate = NA_real_, p = NA_real_))
+
+  c(
+    estimate = unname(out$estimate),
+    p = out$p.value
+  )
+}
+
+safe_eta <- function(num, fac) {
+  ok <- stats::complete.cases(num, fac)
+  if (sum(ok) < 5 || nlevels(factor(fac[ok])) < 2) {
+    return(c(estimate = NA_real_, p = NA_real_))
+  }
+
+  fit <- tryCatch(
+    stats::aov(num[ok] ~ factor(fac[ok])),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) return(c(estimate = NA_real_, p = NA_real_))
+
+  est <- tryCatch(
+    DescTools::EtaSq(fit, type = 1)[1, "eta.sq"],
+    error = function(e) NA_real_
+  )
+
+  p <- tryCatch(
+    summary(fit)[[1]][["Pr(>F)"]][1],
+    error = function(e) NA_real_
+  )
+
+  c(estimate = est, p = p)
+}
+
+safe_cramers_v <- function(x, y) {
+  ok <- stats::complete.cases(x, y)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  tab <- table(x[ok], y[ok])
+  if (min(dim(tab)) < 2) return(c(estimate = NA_real_, p = NA_real_))
+
+  chi <- tryCatch(
+    suppressWarnings(stats::chisq.test(tab)),
+    error = function(e) NULL
+  )
+
+  est <- tryCatch(
+    DescTools::CramerV(tab),
+    error = function(e) NA_real_
+  )
+
+  p <- if (is.null(chi)) NA_real_ else chi$p.value
+
+  c(estimate = est, p = p)
+}
+
+safe_polyserial <- function(x, y_ord) {
+  ok <- stats::complete.cases(x, y_ord)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  est <- tryCatch(
+    polycor::polyserial(x[ok], as.ordered(y_ord[ok]), std.err = FALSE),
+    error = function(e) NA_real_
+  )
+
+  c(estimate = est, p = NA_real_)
+}
+
+safe_polychor <- function(x_ord, y_ord) {
+  ok <- stats::complete.cases(x_ord, y_ord)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  est <- tryCatch(
+    polycor::polychor(x_ord[ok], y_ord[ok]),
+    error = function(e) NA_real_
+  )
+
+  c(estimate = est, p = NA_real_)
+}
+
+root_assoc_df <- df_root %>%
+  dplyr::transmute(
+    ratio_fvfg_dnang = ratio_fvfg_dnang,
+    scn_count_rep    = scn_count_rep,
+    soil_ph          = soil_ph,
+    rdx              = rdx,
+    drw              = drw,
+    fdx              = fdx,
+    yield_kgha       = yield_kgha,
+    product          = as.factor(product),
+    sds_tol          = as.factor(sds_tol),
+    scn_level        = factor(scn_level, ordered = TRUE),
+    fv_level_simple  = factor(fv_level_simple, ordered = TRUE)
+  )
+
+root_var_names <- names(root_assoc_df)
+
+root_var_type <- c(
+  ratio_fvfg_dnang = "numeric",
+  scn_count_rep    = "numeric",
+  soil_ph          = "numeric",
+  rdx              = "numeric",
+  drw              = "numeric",
+  fdx              = "numeric",
+  yield_kgha       = "numeric",
+  product          = "nominal",
+  sds_tol          = "nominal",
+  scn_level        = "ordinal",
+  fv_level_simple  = "ordinal"
+)
+
+root_assoc_mat <- matrix(
+  NA_real_,
+  nrow = length(root_var_names),
+  ncol = length(root_var_names),
+  dimnames = list(root_var_names, root_var_names)
+)
+
+root_p_mat <- matrix(
+  NA_real_,
+  nrow = length(root_var_names),
+  ncol = length(root_var_names),
+  dimnames = list(root_var_names, root_var_names)
+)
+
+for (i in seq_along(root_var_names)) {
+  for (j in seq_along(root_var_names)) {
+
+    xi <- root_assoc_df[[root_var_names[i]]]
+    xj <- root_assoc_df[[root_var_names[j]]]
+    ti <- root_var_type[[root_var_names[i]]]
+    tj <- root_var_type[[root_var_names[j]]]
+
+    if (i == j) {
+      root_assoc_mat[i, j] <- 1
+      root_p_mat[i, j] <- 0
+      next
+    }
+
+    res <- c(estimate = NA_real_, p = NA_real_)
+
+    if (ti == "numeric" && tj == "numeric") {
+      res <- safe_cor_test(xi, xj, method = "pearson")
+
+    } else if (ti == "numeric" && tj == "nominal") {
+      res <- safe_eta(xi, xj)
+
+    } else if (ti == "nominal" && tj == "numeric") {
+      res <- safe_eta(xj, xi)
+
+    } else if (ti == "nominal" && tj == "nominal") {
+      res <- safe_cramers_v(xi, xj)
+
+    } else if (ti == "numeric" && tj == "ordinal") {
+      res <- safe_polyserial(xi, xj)
+
+    } else if (ti == "ordinal" && tj == "numeric") {
+      res <- safe_polyserial(xj, xi)
+
+    } else if (ti == "ordinal" && tj == "ordinal") {
+      res <- safe_polychor(xi, xj)
+
+    } else if (ti == "nominal" && tj == "ordinal") {
+      res <- safe_cramers_v(xi, xj)
+
+    } else if (ti == "ordinal" && tj == "nominal") {
+      res <- safe_cramers_v(xi, xj)
+    }
+
+    res_clean <- safe_extract_result(res)
+
+    # force scalar numeric values
+    est_val <- if (length(res_clean["estimate"]) == 1) as.numeric(res_clean["estimate"]) else NA_real_
+    p_val   <- if (length(res_clean["p"]) == 1) as.numeric(res_clean["p"]) else NA_real_
+
+    root_assoc_mat[i, j] <- est_val
+    root_p_mat[i, j] <- p_val
+  }
+}
+
+readr::write_csv(
+  as.data.frame(root_assoc_mat) %>% tibble::rownames_to_column("variable"),
+  "root_association_matrix.csv"
+)
+
+readr::write_csv(
+  as.data.frame(root_p_mat) %>% tibble::rownames_to_column("variable"),
+  "root_association_pvalues.csv"
+)
+
+png("fig_root_association_matrix.png", width = 1700, height = 1500, res = 220)
+corrplot::corrplot(
+  root_assoc_mat,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.srt = 45,
+  na.label = " ",
+  mar = c(0, 0, 2, 0),
+  title = "Root subset mixed-type association matrix"
+)
+dev.off()
+```
+# -----------------------------
+# 3. Mini-network association mapping
+# -----------------------------
+```{r}
+# Numeric-focused "mini-network" for the root pathway
+root_net_df <- df_root %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    rdx,
+    drw,
+    fdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+root_net_cor <- stats::cor(
+  root_net_df,
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)
+
+root_net_p <- matrix(
+  NA_real_,
+  nrow = ncol(root_net_df),
+  ncol = ncol(root_net_df),
+  dimnames = list(names(root_net_df), names(root_net_df))
+)
+
+for (i in seq_len(ncol(root_net_df))) {
+  for (j in seq_len(ncol(root_net_df))) {
+    if (i == j) {
+      root_net_p[i, j] <- 0
+    } else {
+      ct <- suppressWarnings(
+        stats::cor.test(
+          root_net_df[[i]],
+          root_net_df[[j]],
+          method = "spearman"
+        )
+      )
+      root_net_p[i, j] <- ct$p.value
+    }
+  }
+}
+
+root_edge_tbl <- as.data.frame(as.table(root_net_cor)) %>%
+  dplyr::rename(from = Var1, to = Var2, weight = Freq) %>%
+  dplyr::mutate(p = as.vector(root_net_p)) %>%
+  dplyr::filter(from != to) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(pair = paste(sort(c(from, to)), collapse = "__")) %>%
+  dplyr::ungroup() %>%
+  dplyr::distinct(pair, .keep_all = TRUE) %>%
+  dplyr::filter(!is.na(weight), abs(weight) >= 0.10, p < 0.05) %>%
+  dplyr::mutate(
+    layout_weight = abs(weight),
+    sign_class = factor(ifelse(weight > 0, "positive", "negative"),
+                        levels = c("positive", "negative"))
+  )
+
+root_node_tbl <- tibble::tibble(
+  name = colnames(root_net_cor),
+  category = factor(
+    c("pathogen", "pathogen", "soil", "disease", "root", "disease", "yield"),
+    levels = c("pathogen", "soil", "root", "disease", "yield")
+  )
+)
+
+root_graph_obj <- tidygraph::tbl_graph(
+  nodes = root_node_tbl,
+  edges = root_edge_tbl,
+  directed = FALSE
+)
+
+p_root_net <- ggraph::ggraph(
+  root_graph_obj,
+  layout = "fr",
+  weights = layout_weight
+) +
+  ggraph::geom_edge_link(
+    ggplot2::aes(
+      edge_width = abs(weight),
+      edge_alpha = abs(weight),
+      edge_colour = sign_class,
+      edge_linetype = sign_class
+    )
+  ) +
+  ggraph::geom_node_point(
+    ggplot2::aes(shape = category),
+    size = 8
+  ) +
+  ggraph::geom_node_text(
+    ggplot2::aes(label = name),
+    repel = TRUE
+  ) +
+  ggraph::scale_edge_width(range = c(0.5, 2.5)) +
+  ggraph::scale_edge_alpha(range = c(0.4, 0.9)) +
+  ggraph::scale_edge_colour_manual(
+    values = c(
+      positive = "steelblue4",
+      negative = "firebrick3"
+    )
+  ) +
+  ggraph::scale_edge_linetype_manual(
+    values = c(
+      positive = "solid",
+      negative = "dashed"
+    )
+  ) +
+  ggplot2::labs(
+    title = "Root subset mini-network: pathogen, root disease, foliar disease, and yield"
+  ) +
+  ggplot2::theme_void()
+
+ggplot2::ggsave(
+  "fig_root_mini_network.png",
+  p_root_net,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+# -----------------------------
+# 4. PCA for root subset
+# -----------------------------
+```{r}
+# Numeric PCA input
+root_pca_df <- df_root %>%
+  select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    rdx,
+    drw,
+    fdx,
+    yield_kgha
+  ) %>%
+  drop_na()
+
+root_pca_res <- FactoMineR::PCA(root_pca_df, scale.unit = TRUE, graph = FALSE)
+
+# Save loadings
+root_pca_loadings <- as.data.frame(root_pca_res$var$coord) %>%
+  rownames_to_column("variable")
+write_csv(root_pca_loadings, "root_pca_loadings.csv")
+
+# Scree plot
+p_root_scree <- factoextra::fviz_eig(root_pca_res, addlabels = TRUE) +
+  labs(title = "Root subset PCA scree plot")
+
+ggsave("fig_root_pca_scree.png", p_root_scree, width = 7, height = 5, dpi = 300)
+
+# PCA biplot by condensed Fv bin
+root_pca_fv <- df_root %>%
+  select(
+    fv_level_simple,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    rdx,
+    drw,
+    fdx,
+    yield_kgha
+  ) %>%
+  drop_na()
+
+root_pca_res_fv <- FactoMineR::PCA(
+  root_pca_fv %>% select(-fv_level_simple),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+p_root_pca_fv <- factoextra::fviz_pca_biplot(
+  root_pca_res_fv,
+  geom.ind = "point",
+  habillage = root_pca_fv$fv_level_simple,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  repel = TRUE
+) +
+  labs(title = "Root subset PCA biplot by Fv abundance class")
+
+ggsave("fig_root_pca_biplot_fv_simple.png", p_root_pca_fv, width = 8, height = 6, dpi = 300)
+
+# Optional finer Fv factor version
+root_pca_fv_simple <- df_root %>%
+  select(
+    fv_level_simple,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    rdx,
+    drw,
+    fdx,
+    yield_kgha
+  ) %>%
+  drop_na()
+
+root_pca_res_fv_simple <- FactoMineR::PCA(
+  root_pca_fv_simple %>% select(-fv_level_simple),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+p_root_pca_fv_simple <- factoextra::fviz_pca_biplot(
+  root_pca_res_fv_simple,
+  geom.ind = "point",
+  habillage = root_pca_fv_simple$fv_level_simple,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  repel = TRUE
+) +
+  labs(title = "Root subset PCA biplot by detailed Fv abundance class")
+
+ggsave("fig_root_pca_biplot_fv_simple.png", p_root_pca_fv_simple, width = 9, height = 7, dpi = 300)
+
+# PCA by product
+root_pca_prod <- df_root %>%
+  select(
+    product,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    rdx,
+    drw,
+    fdx,
+    yield_kgha
+  ) %>%
+  drop_na()
+
+root_pca_res_prod <- FactoMineR::PCA(
+  root_pca_prod %>% select(-product),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+p_root_pca_prod <- factoextra::fviz_pca_biplot(
+  root_pca_res_prod,
+  geom.ind = "point",
+  habillage = root_pca_prod$product,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  repel = TRUE
+) +
+  labs(title = "Root subset PCA biplot by product")
+
+ggsave("fig_root_pca_biplot_product.png", p_root_pca_prod, width = 8, height = 6, dpi = 300)
+
+# PCA by SDS tolerance
+root_pca_tol <- df_root %>%
+  select(
+    sds_tol,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    rdx,
+    drw,
+    fdx,
+    yield_kgha
+  ) %>%
+  drop_na()
+
+root_pca_res_tol <- FactoMineR::PCA(
+  root_pca_tol %>% select(-sds_tol),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+p_root_pca_tol <- factoextra::fviz_pca_biplot(
+  root_pca_res_tol,
+  geom.ind = "point",
+  habillage = root_pca_tol$sds_tol,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  repel = TRUE
+) +
+  labs(title = "Root subset PCA biplot by SDS tolerance")
+
+ggsave("fig_root_pca_biplot_sds_tol.png", p_root_pca_tol, width = 8, height = 6, dpi = 300)
+```
+# -----------------------------
+# 6A. FDX model
+# -----------------------------
+```{r}
+# Type III ANOVA requires appropriate contrasts
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# Build model-ready datasets with consistent variables
+df_fdx_mod <- df_fdx %>%
+  mutate(
+    # scale continuous predictors for interaction stability / interpretability
+    z_log10_fv  = as.numeric(scale(log10_fv)),
+    z_log10_scn = as.numeric(scale(log10_scn)),
+    exp_siteyear = interaction(siteyear, exp, drop = TRUE)
+  )
+
+df_fdx_ph_mod <- df_fdx_ph %>%
+  mutate(
+    z_log10_fv  = as.numeric(scale(log10_fv)),
+    z_log10_scn = as.numeric(scale(log10_scn)),
+    z_soil_ph   = as.numeric(scale(soil_ph)),
+    exp_siteyear = interaction(siteyear, exp, drop = TRUE)
+  )
+
+# Core model
+# state dropped because siteyear already captures environment
+# exp nested within siteyear via exp_siteyear
+m_fdx_1 <- lmer(
+  log1p_fdx ~ z_log10_fv + z_log10_scn + product + sds_tol +
+  (1 | siteyear) + (1 | exp_siteyear),
+  data = df_fdx_mod,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+cat("\n================ FDX model 1 ================\n")
+print(summary(m_fdx_1))
+print(joint_tests(m_fdx_1))
+print(performance::check_singularity(m_fdx_1))
+print(performance::check_collinearity(m_fdx_1))
+
+# Optional pH model
+m_fdx_2 <- lmer(
+  log1p_fdx ~ z_log10_fv + z_log10_scn + log1p_rdx + z_soil_ph + product:sds_tol +
+  (1 | siteyear) + (1 | exp_siteyear),
+  data = df_fdx_ph_mod,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+cat("\n================ FDX model 2 (with pH) ================\n")
+print(summary(m_fdx_2))
+print(joint_tests(m_fdx_2))
+print(performance::check_singularity(m_fdx_2))
+print(performance::check_collinearity(m_fdx_2))
+
+# IMPORTANT:
+# To compare AIC, fit the no-pH model on the same rows used by the pH model
+m_fdx_1_same_rows <- lmer(
+  log1p_fdx ~ z_log10_fv + z_log10_scn + product + sds_tol +
+  (1 | siteyear) + (1 | exp_siteyear),
+  data = df_fdx_ph_mod,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+cat("\n================ AIC comparison on same rows ================\n")
+print(AIC(m_fdx_1_same_rows, m_fdx_2))
+
+# EMMs for product from core model
+emm_fdx_product <- emmeans(m_fdx_2, ~ product:sds_tol, type = "response")
+
+multcomp::cld(emm_fdx_product)
+
+cat("\n================ FDX product EMMs ================\n")
+summary(m_fdx_2)
+print(multcomp::cld(emm_fdx_product))
+print(pairs(emm_fdx_product, adjust = "tukey"))
+print(cld(emm_fdx_product, Letters = letters, adjust = "tukey"))
+
+
+fdx_emm_bt <- as.data.frame(emm_fdx_product) %>%
+  dplyr::mutate(
+    emmean_bt   = exp(emmean) - 1,
+    lower.CL_bt = exp(lower.CL) - 1,
+    upper.CL_bt = exp(upper.CL) - 1
+  )
+
+fdx_emm_bt_fmt <- fdx_emm_bt %>%
+  dplyr::transmute(
+    product:sds_tol,
+    EMM_bt = round(emmean_bt, 2),
+    lower.CL_bt = round(lower.CL_bt, 2),
+    upper.CL_bt = round(upper.CL_bt, 2)
+  )
+
+#emmeans::regrid(emm_fdx_product, transform = "response")
+#performance::check_singularity(m_fdx_1)
+#performance::check_singularity(m_fdx_2)
+```
+
+# ============================================================
+# FDX downstream analyses
+# Correlation, association matrix, mini-network, PCA
+# ============================================================
+
+# -----------------------------
+# 1. FDX subset numeric correlations
+# -----------------------------
+```{r}
+fdx_num <- df_fdx %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    yield_kgha
+  )
+
+# Spearman correlation matrix
+fdx_cor <- stats::cor(
+  fdx_num,
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)
+
+cat("\n================ FDX subset numeric Spearman correlation matrix ================\n")
+print(fdx_cor)
+
+# Pairwise Spearman tests
+fdx_cor_tests <- expand.grid(
+  var1 = names(fdx_num),
+  var2 = names(fdx_num),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::filter(var1 < var2) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    test = list(
+      suppressWarnings(
+        stats::cor.test(
+          fdx_num[[var1]],
+          fdx_num[[var2]],
+          method = "spearman",
+          use = "pairwise.complete.obs"
+        )
+      )
+    ),
+    rho = unname(test$estimate),
+    p_value = test$p.value
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(var1, var2, rho, p_value)
+
+cat("\n================ FDX subset pairwise Spearman correlations ================\n")
+print(fdx_cor_tests)
+
+readr::write_csv(fdx_cor_tests, "fdx_pairwise_spearman_correlations.csv")
+
+# Visualize numeric correlation matrix
+png("fig_fdx_numeric_correlation_matrix.png", width = 1500, height = 1300, res = 220)
+corrplot::corrplot(
+  fdx_cor,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.srt = 45,
+  addCoef.col = "black",
+  number.cex = 0.75,
+  mar = c(0, 0, 2, 0),
+  title = "FDX subset numeric Spearman correlation matrix"
+)
+dev.off()
+
+```
+
+# -----------------------------
+# 2. Mixed-type association matrix for FDX subset
+# -----------------------------
+```{r}
+# Helper functions (safe versions)
+safe_extract_result <- function(res) {
+  out <- c(estimate = NA_real_, p = NA_real_)
+
+  if (is.null(res) || length(res) == 0) return(out)
+
+  if (is.numeric(res) && length(res) == 1 && is.null(names(res))) {
+    out["estimate"] <- as.numeric(res)
+    return(out)
+  }
+
+  if (is.atomic(res) && !is.null(names(res))) {
+    if ("estimate" %in% names(res) && length(res[["estimate"]]) == 1) {
+      out["estimate"] <- suppressWarnings(as.numeric(res[["estimate"]]))
+    }
+    if ("p" %in% names(res) && length(res[["p"]]) == 1) {
+      out["p"] <- suppressWarnings(as.numeric(res[["p"]]))
+    }
+    return(out)
+  }
+
+  if (is.list(res)) {
+    if (!is.null(res$estimate) && length(res$estimate) == 1) {
+      out["estimate"] <- suppressWarnings(as.numeric(res$estimate))
+    }
+    if (!is.null(res$p) && length(res$p) == 1) {
+      out["p"] <- suppressWarnings(as.numeric(res$p))
+    }
+    return(out)
+  }
+
+  out
+}
+
+safe_cor_test <- function(x, y, method = "pearson") {
+  ok <- stats::complete.cases(x, y)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  out <- tryCatch(
+    suppressWarnings(stats::cor.test(x[ok], y[ok], method = method)),
+    error = function(e) NULL
+  )
+
+  if (is.null(out)) return(c(estimate = NA_real_, p = NA_real_))
+
+  c(
+    estimate = unname(out$estimate),
+    p = out$p.value
+  )
+}
+
+safe_eta <- function(num, fac) {
+  ok <- stats::complete.cases(num, fac)
+  if (sum(ok) < 5 || nlevels(factor(fac[ok])) < 2) {
+    return(c(estimate = NA_real_, p = NA_real_))
+  }
+
+  fit <- tryCatch(
+    stats::aov(num[ok] ~ factor(fac[ok])),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) return(c(estimate = NA_real_, p = NA_real_))
+
+  est <- tryCatch(
+    DescTools::EtaSq(fit, type = 1)[1, "eta.sq"],
+    error = function(e) NA_real_
+  )
+
+  p <- tryCatch(
+    summary(fit)[[1]][["Pr(>F)"]][1],
+    error = function(e) NA_real_
+  )
+
+  c(estimate = est, p = p)
+}
+
+safe_cramers_v <- function(x, y) {
+  ok <- stats::complete.cases(x, y)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  tab <- table(x[ok], y[ok])
+  if (min(dim(tab)) < 2) return(c(estimate = NA_real_, p = NA_real_))
+
+  chi <- tryCatch(
+    suppressWarnings(stats::chisq.test(tab)),
+    error = function(e) NULL
+  )
+
+  est <- tryCatch(
+    DescTools::CramerV(tab),
+    error = function(e) NA_real_
+  )
+
+  p <- if (is.null(chi)) NA_real_ else chi$p.value
+
+  c(estimate = est, p = p)
+}
+
+safe_polyserial <- function(x, y_ord) {
+  ok <- stats::complete.cases(x, y_ord)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  est <- tryCatch(
+    polycor::polyserial(x[ok], as.ordered(y_ord[ok]), std.err = FALSE),
+    error = function(e) NA_real_
+  )
+
+  c(estimate = est, p = NA_real_)
+}
+
+safe_polychor <- function(x_ord, y_ord) {
+  ok <- stats::complete.cases(x_ord, y_ord)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  est <- tryCatch(
+    polycor::polychor(x_ord[ok], y_ord[ok]),
+    error = function(e) NA_real_
+  )
+
+  c(estimate = est, p = NA_real_)
+}
+
+fdx_assoc_df <- df_fdx %>%
+  dplyr::transmute(
+    ratio_fvfg_dnang = ratio_fvfg_dnang,
+    scn_count_rep    = scn_count_rep,
+    soil_ph          = soil_ph,
+    fdx              = fdx,
+    yield_kgha       = yield_kgha,
+    product          = as.factor(product),
+    sds_tol          = as.factor(sds_tol),
+    fdx_level        = factor(fdx_level, ordered = TRUE),
+    scn_level        = factor(scn_level, ordered = TRUE),
+    fv_level_simple  = factor(fv_level_simple, ordered = TRUE)
+  )
+
+fdx_var_names <- names(fdx_assoc_df)
+
+fdx_var_type <- c(
+  ratio_fvfg_dnang = "numeric",
+  scn_count_rep    = "numeric",
+  soil_ph          = "numeric",
+  fdx              = "numeric",
+  yield_kgha       = "numeric",
+  product          = "nominal",
+  sds_tol          = "nominal",
+  fdx_level        = "ordinal",
+  scn_level        = "ordinal",
+  fv_level_simple  = "ordinal"
+)
+
+fdx_assoc_mat <- matrix(
+  NA_real_,
+  nrow = length(fdx_var_names),
+  ncol = length(fdx_var_names),
+  dimnames = list(fdx_var_names, fdx_var_names)
+)
+
+fdx_p_mat <- matrix(
+  NA_real_,
+  nrow = length(fdx_var_names),
+  ncol = length(fdx_var_names),
+  dimnames = list(fdx_var_names, fdx_var_names)
+)
+
+for (i in seq_along(fdx_var_names)) {
+  for (j in seq_along(fdx_var_names)) {
+
+    xi <- fdx_assoc_df[[fdx_var_names[i]]]
+    xj <- fdx_assoc_df[[fdx_var_names[j]]]
+    ti <- fdx_var_type[[fdx_var_names[i]]]
+    tj <- fdx_var_type[[fdx_var_names[j]]]
+
+    if (i == j) {
+      fdx_assoc_mat[i, j] <- 1
+      fdx_p_mat[i, j] <- 0
+      next
+    }
+
+    res <- c(estimate = NA_real_, p = NA_real_)
+
+    if (ti == "numeric" && tj == "numeric") {
+      res <- safe_cor_test(xi, xj, method = "pearson")
+    } else if (ti == "numeric" && tj == "nominal") {
+      res <- safe_eta(xi, xj)
+    } else if (ti == "nominal" && tj == "numeric") {
+      res <- safe_eta(xj, xi)
+    } else if (ti == "nominal" && tj == "nominal") {
+      res <- safe_cramers_v(xi, xj)
+    } else if (ti == "numeric" && tj == "ordinal") {
+      res <- safe_polyserial(xi, xj)
+    } else if (ti == "ordinal" && tj == "numeric") {
+      res <- safe_polyserial(xj, xi)
+    } else if (ti == "ordinal" && tj == "ordinal") {
+      res <- safe_polychor(xi, xj)
+    } else if (ti == "nominal" && tj == "ordinal") {
+      res <- safe_cramers_v(xi, xj)
+    } else if (ti == "ordinal" && tj == "nominal") {
+      res <- safe_cramers_v(xi, xj)
+    }
+
+    res_clean <- safe_extract_result(res)
+
+    est_val <- if (length(res_clean["estimate"]) == 1) as.numeric(res_clean["estimate"]) else NA_real_
+    p_val   <- if (length(res_clean["p"]) == 1) as.numeric(res_clean["p"]) else NA_real_
+
+    fdx_assoc_mat[i, j] <- est_val
+    fdx_p_mat[i, j] <- p_val
+  }
+}
+
+readr::write_csv(
+  as.data.frame(fdx_assoc_mat) %>% tibble::rownames_to_column("variable"),
+  "fdx_association_matrix.csv"
+)
+
+readr::write_csv(
+  as.data.frame(fdx_p_mat) %>% tibble::rownames_to_column("variable"),
+  "fdx_association_pvalues.csv"
+)
+
+png("fig_fdx_association_matrix.png", width = 1600, height = 1450, res = 220)
+corrplot::corrplot(
+  fdx_assoc_mat,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.srt = 45,
+  na.label = " ",
+  mar = c(0, 0, 2, 0),
+  title = "FDX subset mixed-type association matrix"
+)
+dev.off()
+
+```
+# -----------------------------
+# 3. Mini-network association mapping
+# -----------------------------
+```{r}
+fdx_net_df <- df_fdx %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+fdx_net_cor <- stats::cor(
+  fdx_net_df,
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)
+
+fdx_net_p <- matrix(
+  NA_real_,
+  nrow = ncol(fdx_net_df),
+  ncol = ncol(fdx_net_df),
+  dimnames = list(names(fdx_net_df), names(fdx_net_df))
+)
+
+for (i in seq_len(ncol(fdx_net_df))) {
+  for (j in seq_len(ncol(fdx_net_df))) {
+    if (i == j) {
+      fdx_net_p[i, j] <- 0
+    } else {
+      ct <- suppressWarnings(
+        stats::cor.test(
+          fdx_net_df[[i]],
+          fdx_net_df[[j]],
+          method = "spearman"
+        )
+      )
+      fdx_net_p[i, j] <- ct$p.value
+    }
+  }
+}
+
+fdx_edge_tbl <- as.data.frame(as.table(fdx_net_cor)) %>%
+  dplyr::rename(from = Var1, to = Var2, weight = Freq) %>%
+  dplyr::mutate(p = as.vector(fdx_net_p)) %>%
+  dplyr::filter(from != to) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(pair = paste(sort(c(from, to)), collapse = "__")) %>%
+  dplyr::ungroup() %>%
+  dplyr::distinct(pair, .keep_all = TRUE) %>%
+  dplyr::filter(!is.na(weight), abs(weight) >= 0.10, p < 0.05) %>%
+  dplyr::mutate(
+    layout_weight = abs(weight),
+    sign_class = factor(ifelse(weight > 0, "positive", "negative"),
+                        levels = c("positive", "negative"))
+  )
+
+fdx_node_tbl <- tibble::tibble(
+  name = colnames(fdx_net_cor),
+  category = factor(
+    c("pathogen", "pathogen", "soil", "disease", "yield"),
+    levels = c("pathogen", "soil", "disease", "yield")
+  )
+)
+
+fdx_graph_obj <- tidygraph::tbl_graph(
+  nodes = fdx_node_tbl,
+  edges = fdx_edge_tbl,
+  directed = FALSE
+)
+
+p_fdx_net <- ggraph::ggraph(
+  fdx_graph_obj,
+  layout = "fr",
+  weights = layout_weight
+) +
+  ggraph::geom_edge_link(
+    ggplot2::aes(
+      edge_width = abs(weight),
+      edge_alpha = abs(weight),
+      edge_colour = sign_class,
+      edge_linetype = sign_class
+    )
+  ) +
+  ggraph::geom_node_point(
+    ggplot2::aes(shape = category),
+    size = 8
+  ) +
+  ggraph::geom_node_text(
+    ggplot2::aes(label = name),
+    repel = TRUE
+  ) +
+  ggraph::scale_edge_width(range = c(0.5, 2.5)) +
+  ggraph::scale_edge_alpha(range = c(0.4, 0.9)) +
+  ggraph::scale_edge_colour_manual(
+    values = c(
+      positive = "steelblue4",
+      negative = "firebrick3"
+    )
+  ) +
+  ggraph::scale_edge_linetype_manual(
+    values = c(
+      positive = "solid",
+      negative = "dashed"
+    )
+  ) +
+  ggplot2::labs(
+    title = "FDX subset mini-network: pathogen, foliar disease, soil, and yield"
+  ) +
+  ggplot2::theme_void()
+
+ggplot2::ggsave(
+  "fig_fdx_mini_network.png",
+  p_fdx_net,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+```
+
+# -----------------------------
+# 4. PCA for FDX subset
+# -----------------------------
+```{r}
+fdx_pca_df <- df_fdx %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+fdx_pca_res <- FactoMineR::PCA(fdx_pca_df, scale.unit = TRUE, graph = FALSE)
+
+# Save loadings
+fdx_pca_loadings <- as.data.frame(fdx_pca_res$var$coord) %>%
+  tibble::rownames_to_column("variable")
+readr::write_csv(fdx_pca_loadings, "fdx_pca_loadings.csv")
+
+# Scree plot
+p_fdx_scree <- factoextra::fviz_eig(fdx_pca_res, addlabels = TRUE) +
+  ggplot2::labs(title = "FDX subset PCA scree plot")
+
+ggplot2::ggsave("fig_fdx_pca_scree.png", p_fdx_scree, width = 7, height = 5, dpi = 300)
+
+# PCA biplot by FDX level
+fdx_pca_fdxlvl <- df_fdx %>%
+  dplyr::select(
+    fdx_level,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+fdx_pca_res_fdxlvl <- FactoMineR::PCA(
+  fdx_pca_fdxlvl %>% dplyr::select(-fdx_level),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+p_fdx_pca_fdxlvl <- factoextra::fviz_pca_biplot(
+  fdx_pca_res_fdxlvl,
+  geom.ind = "point",
+  habillage = fdx_pca_fdxlvl$fdx_level,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  repel = TRUE
+) +
+  ggplot2::labs(title = "FDX subset PCA biplot by FDX level")
+
+ggplot2::ggsave("fig_fdx_pca_biplot_fdx_level.png", p_fdx_pca_fdxlvl, width = 8, height = 6, dpi = 300)
+
+# PCA biplot by SCN level
+fdx_pca_scn <- df_fdx %>%
+  dplyr::select(
+    scn_level,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+fdx_pca_res_scn <- FactoMineR::PCA(
+  fdx_pca_scn %>% dplyr::select(-scn_level),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+p_fdx_pca_scn <- factoextra::fviz_pca_biplot(
+  fdx_pca_res_scn,
+  geom.ind = "point",
+  habillage = fdx_pca_scn$scn_level,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  repel = TRUE
+) +
+  ggplot2::labs(title = "FDX subset PCA biplot by SCN level")
+
+ggplot2::ggsave("fig_fdx_pca_biplot_scn_level.png", p_fdx_pca_scn, width = 8, height = 6, dpi = 300)
+
+# PCA biplot by condensed Fv level
+fdx_pca_fv_simple <- df_fdx %>%
+  dplyr::select(
+    fv_level_simple,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+fdx_pca_res_fv_simple <- FactoMineR::PCA(
+  fdx_pca_fv_simple %>% dplyr::select(-fv_level_simple),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+p_fdx_pca_fv_simple <- factoextra::fviz_pca_biplot(
+  fdx_pca_res_fv_simple,
+  geom.ind = "point",
+  habillage = fdx_pca_fv_simple$fv_level_simple,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  repel = TRUE
+) +
+  ggplot2::labs(title = "FDX subset PCA biplot by Fv abundance class")
+
+ggplot2::ggsave("fig_fdx_pca_biplot_fv_simple.png", p_fdx_pca_fv_simple, width = 8, height = 6, dpi = 300)
+
+# PCA biplot by detailed Fv level
+fdx_pca_fv_simple <- df_fdx %>%
+  dplyr::select(
+    fv_level_simple,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+fdx_pca_res_fv_simple <- FactoMineR::PCA(
+  fdx_pca_fv_simple %>% dplyr::select(-fv_level_simple),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+p_fdx_pca_fv_simple <- factoextra::fviz_pca_biplot(
+  fdx_pca_res_fv_simple,
+  geom.ind = "point",
+  habillage = fdx_pca_fv_simple$fv_level_simple,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  repel = TRUE
+) +
+  ggplot2::labs(title = "FDX subset PCA biplot by detailed Fv abundance class")
+
+ggplot2::ggsave("fig_fdx_pca_biplot_fv_simple.png", p_fdx_pca_fv_simple, width = 9, height = 7, dpi = 300)
+
+# PCA biplot by product
+fdx_pca_prod <- df_fdx %>%
+  dplyr::select(
+    product,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+fdx_pca_res_prod <- FactoMineR::PCA(
+  fdx_pca_prod %>% dplyr::select(-product),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+p_fdx_pca_prod <- factoextra::fviz_pca_biplot(
+  fdx_pca_res_prod,
+  geom.ind = "point",
+  habillage = fdx_pca_prod$product,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  repel = TRUE
+) +
+  ggplot2::labs(title = "FDX subset PCA biplot by product")
+
+ggplot2::ggsave("fig_fdx_pca_biplot_product.png", p_fdx_pca_prod, width = 8, height = 6, dpi = 300)
+```
+# -----------------------------
+# 6B. Yield LMMs
+# -----------------------------
+```{r}
+
+tmp <- df_yield %>%
+  summarise(
+    n_siteyear = n_distinct(siteyear),
+    n_state    = n_distinct(state),
+    n_location = n_distinct(location),
+    n_year     = n_distinct(year)
+  )
+
+cat(
+  paste0(
+    "Field trials were conducted across ",
+    tmp$n_siteyear, " site-years spanning ",
+    tmp$n_state, " U.S. states and Ontario, Canada, encompassing ",
+    tmp$n_location, " locations over ",
+    tmp$n_year, " growing seasons."
+  )
+)
+
+# Build model-ready datasets with consistent variables
+df_yield_mod <- df_yield %>%
+  mutate(
+    # scale continuous predictors for interaction stability / interpretability
+    z_log10_fv  = as.numeric(scale(log10_fv)),
+    z_log10_scn = as.numeric(scale(log10_scn)),
+    z_soil_ph   = as.numeric(scale(soil_ph)),
+    exp_siteyear = interaction(siteyear, exp, drop = TRUE)
+  )
+
+cat("\n================ Yield model 1: pathogen + environment ================\n")
+
+m_yield_1 <- lmer(
+  yield_kgha ~
+    z_log10_fv + 
+    z_log10_scn +
+    log1p_fdx +
+    log1p_rdx +
+    z_soil_ph +
+    sds_tol:product +
+    (1 | siteyear) +
+    (1 | exp_siteyear),
+  data = df_yield_mod,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000))
+)
+
+print(summary(m_yield_1))
+print(emmeans::joint_tests(m_yield_1))
+print(multcomp::cld(emmeans(m_yield_1, ~ sds_tol)))
+
+cat("\nChecking singularity:\n")
+print(performance::check_singularity(m_yield_1))
+
+cat("\nChecking multicollinearity:\n")
+print(performance::check_collinearity(m_yield_1))
+
+
+# ================================
+# Yield model 2: add foliar SDS
+# ================================
+
+cat("\n================ Yield model 2: + FDX ================\n")
+
+m_yield_2 <- lmer(
+  yield_kgha ~
+    z_log10_fv +
+    z_log10_scn +
+    z_soil_ph +
+    product:sds_tol +
+    (1|log1p_fdx) +
+    (1|log1p_rdx) +
+    (1 | siteyear) +
+    (1 | exp_siteyear),
+  data = df_yield_mod,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000))
+)
+
+print(summary(m_yield_2))
+print(emmeans::joint_tests(m_yield_2))
+
+cat("\nChecking singularity:\n")
+print(performance::check_singularity(m_yield_2))
+
+cat("\nChecking multicollinearity:\n")
+print(performance::check_collinearity(m_yield_2))
+
+
+# ================================
+# Yield model 3: add root disease
+# ================================
+
+cat("\n================ Yield model 3: + RDX ================\n")
+
+m_yield_3 <- lmer(
+  yield_kgha ~
+    log1p_fdx +
+    log1p_rdx +
+    product +
+    (1 | siteyear) +
+    (1 | exp_siteyear),
+  data = df_yield_mod,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000))
+)
+
+print(summary(m_yield_3))
+print(emmeans::joint_tests(m_yield_3))
+
+cat("\nChecking singularity:\n")
+print(performance::check_singularity(m_yield_3))
+
+cat("\nChecking multicollinearity:\n")
+print(performance::check_collinearity(m_yield_3))
+
+
+# ================================
+# Model comparison
+# ================================
+
+cat("\n================ Yield model comparison ================\n")
+
+print(AIC(m_yield_1, m_yield_2, m_yield_3))
+
+
+# ================================
+# Product marginal means
+# ================================
+
+emm_yield_product <- emmeans(m_yield_2, ~ product:sds_tol)
+
+cat("\n================ Yield product EMMs ================\n")
+
+print(emm_yield_product)
+print(pairs(emm_yield_product, adjust = "tukey"))
+
+print(
+  multcomp::cld(
+    emm_yield_product,
+    Letters = letters,
+    adjust = "tukey"
+  )
+)
+```
+# ============================================================
+# Yield downstream analyses
+# Correlation, association matrix, mini-network, PCA
+# ============================================================
+
+# -----------------------------
+# 1. Yield subset numeric correlations
+# -----------------------------
+```{r}
+yield_num <- df_yield_mod %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    rdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+yield_cor <- stats::cor(
+  yield_num,
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)
+
+cat("\n================ Yield subset numeric Spearman correlation matrix ================\n")
+print(yield_cor)
+
+yield_cor_tests <- expand.grid(
+  var1 = names(yield_num),
+  var2 = names(yield_num),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::filter(var1 < var2) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    test = list(
+      suppressWarnings(
+        stats::cor.test(
+          yield_num[[var1]],
+          yield_num[[var2]],
+          method = "spearman",
+          use = "pairwise.complete.obs"
+        )
+      )
+    ),
+    rho = unname(test$estimate),
+    p_value = test$p.value
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(var1, var2, rho, p_value)
+
+cat("\n================ Yield subset pairwise Spearman correlations ================\n")
+print(yield_cor_tests)
+
+readr::write_csv(yield_cor_tests, "yield_pairwise_spearman_correlations.csv")
+
+png("fig_yield_numeric_correlation_matrix.png", width = 1600, height = 1400, res = 220)
+corrplot::corrplot(
+  yield_cor,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.srt = 45,
+  addCoef.col = "black",
+  number.cex = 0.7,
+  mar = c(0, 0, 2, 0),
+  title = "Yield subset numeric Spearman correlation matrix"
+)
+dev.off()
+
+```
+
+# -----------------------------
+# 2. Mixed-type association matrix
+# -----------------------------
+```{r}
+# safe helpers reused here for self-contained chunk
+
+safe_extract_result <- function(res) {
+  out <- c(estimate = NA_real_, p = NA_real_)
+
+  if (is.null(res) || length(res) == 0) return(out)
+
+  if (is.numeric(res) && length(res) == 1 && is.null(names(res))) {
+    out["estimate"] <- as.numeric(res)
+    return(out)
+  }
+
+  if (is.atomic(res) && !is.null(names(res))) {
+    if ("estimate" %in% names(res) && length(res[["estimate"]]) == 1) {
+      out["estimate"] <- suppressWarnings(as.numeric(res[["estimate"]]))
+    }
+    if ("p" %in% names(res) && length(res[["p"]]) == 1) {
+      out["p"] <- suppressWarnings(as.numeric(res[["p"]]))
+    }
+    return(out)
+  }
+
+  if (is.list(res)) {
+    if (!is.null(res$estimate) && length(res$estimate) == 1) {
+      out["estimate"] <- suppressWarnings(as.numeric(res$estimate))
+    }
+    if (!is.null(res$p) && length(res$p) == 1) {
+      out["p"] <- suppressWarnings(as.numeric(res$p))
+    }
+    return(out)
+  }
+
+  out
+}
+
+safe_cor_test <- function(x, y, method = "pearson") {
+  ok <- stats::complete.cases(x, y)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  out <- tryCatch(
+    suppressWarnings(stats::cor.test(x[ok], y[ok], method = method)),
+    error = function(e) NULL
+  )
+
+  if (is.null(out)) return(c(estimate = NA_real_, p = NA_real_))
+
+  c(
+    estimate = unname(out$estimate),
+    p = out$p.value
+  )
+}
+
+safe_eta <- function(num, fac) {
+  ok <- stats::complete.cases(num, fac)
+  if (sum(ok) < 5 || nlevels(factor(fac[ok])) < 2) {
+    return(c(estimate = NA_real_, p = NA_real_))
+  }
+
+  fit <- tryCatch(
+    stats::aov(num[ok] ~ factor(fac[ok])),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) return(c(estimate = NA_real_, p = NA_real_))
+
+  est <- tryCatch(
+    DescTools::EtaSq(fit, type = 1)[1, "eta.sq"],
+    error = function(e) NA_real_
+  )
+
+  p <- tryCatch(
+    summary(fit)[[1]][["Pr(>F)"]][1],
+    error = function(e) NA_real_
+  )
+
+  c(estimate = est, p = p)
+}
+
+safe_cramers_v <- function(x, y) {
+  ok <- stats::complete.cases(x, y)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  tab <- table(x[ok], y[ok])
+  if (min(dim(tab)) < 2) return(c(estimate = NA_real_, p = NA_real_))
+
+  chi <- tryCatch(
+    suppressWarnings(stats::chisq.test(tab)),
+    error = function(e) NULL
+  )
+
+  est <- tryCatch(
+    DescTools::CramerV(tab),
+    error = function(e) NA_real_
+  )
+
+  p <- if (is.null(chi)) NA_real_ else chi$p.value
+
+  c(estimate = est, p = p)
+}
+
+safe_polyserial <- function(x, y_ord) {
+  ok <- stats::complete.cases(x, y_ord)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  est <- tryCatch(
+    polycor::polyserial(x[ok], as.ordered(y_ord[ok]), std.err = FALSE),
+    error = function(e) NA_real_
+  )
+
+  c(estimate = est, p = NA_real_)
+}
+
+safe_polychor <- function(x_ord, y_ord) {
+  ok <- stats::complete.cases(x_ord, y_ord)
+  if (sum(ok) < 5) return(c(estimate = NA_real_, p = NA_real_))
+
+  est <- tryCatch(
+    polycor::polychor(x_ord[ok], y_ord[ok]),
+    error = function(e) NA_real_
+  )
+
+  c(estimate = est, p = NA_real_)
+}
+
+yield_assoc_df <- df_fdx_ph_mod %>%
+  dplyr::transmute(
+    ratio_fvfg_dnang = ratio_fvfg_dnang,
+    scn_count_rep    = scn_count_rep,
+    soil_ph          = soil_ph,
+    fdx              = fdx,
+    rdx              = rdx,
+    yield_kgha       = yield_kgha,
+    product          = as.factor(product),
+    sds_tol          = as.factor(sds_tol),
+    fdx_level        = factor(fdx_level, ordered = TRUE),
+    scn_level        = factor(scn_level, ordered = TRUE),
+    fv_level_simple  = factor(fv_level_simple, ordered = TRUE)
+  )
+
+yield_var_names <- names(yield_assoc_df)
+
+yield_var_type <- c(
+  ratio_fvfg_dnang = "numeric",
+  scn_count_rep    = "numeric",
+  soil_ph          = "numeric",
+  fdx              = "numeric",
+  rdx              = "numeric",
+  yield_kgha       = "numeric",
+  product          = "nominal",
+  sds_tol          = "nominal",
+  fdx_level        = "ordinal",
+  scn_level        = "ordinal",
+  fv_level_simple  = "ordinal"
+)
+
+yield_assoc_mat <- matrix(
+  NA_real_,
+  nrow = length(yield_var_names),
+  ncol = length(yield_var_names),
+  dimnames = list(yield_var_names, yield_var_names)
+)
+
+yield_p_mat <- matrix(
+  NA_real_,
+  nrow = length(yield_var_names),
+  ncol = length(yield_var_names),
+  dimnames = list(yield_var_names, yield_var_names)
+)
+
+for (i in seq_along(yield_var_names)) {
+  for (j in seq_along(yield_var_names)) {
+
+    xi <- yield_assoc_df[[yield_var_names[i]]]
+    xj <- yield_assoc_df[[yield_var_names[j]]]
+    ti <- yield_var_type[[yield_var_names[i]]]
+    tj <- yield_var_type[[yield_var_names[j]]]
+
+    if (i == j) {
+      yield_assoc_mat[i, j] <- 1
+      yield_p_mat[i, j] <- 0
+      next
+    }
+
+    res <- c(estimate = NA_real_, p = NA_real_)
+
+    if (ti == "numeric" && tj == "numeric") {
+      res <- safe_cor_test(xi, xj, method = "pearson")
+    } else if (ti == "numeric" && tj == "nominal") {
+      res <- safe_eta(xi, xj)
+    } else if (ti == "nominal" && tj == "numeric") {
+      res <- safe_eta(xj, xi)
+    } else if (ti == "nominal" && tj == "nominal") {
+      res <- safe_cramers_v(xi, xj)
+    } else if (ti == "numeric" && tj == "ordinal") {
+      res <- safe_polyserial(xi, xj)
+    } else if (ti == "ordinal" && tj == "numeric") {
+      res <- safe_polyserial(xj, xi)
+    } else if (ti == "ordinal" && tj == "ordinal") {
+      res <- safe_polychor(xi, xj)
+    } else if (ti == "nominal" && tj == "ordinal") {
+      res <- safe_cramers_v(xi, xj)
+    } else if (ti == "ordinal" && tj == "nominal") {
+      res <- safe_cramers_v(xi, xj)
+    }
+
+    res_clean <- safe_extract_result(res)
+
+    est_val <- if (length(res_clean["estimate"]) == 1) as.numeric(res_clean["estimate"]) else NA_real_
+    p_val   <- if (length(res_clean["p"]) == 1) as.numeric(res_clean["p"]) else NA_real_
+
+    yield_assoc_mat[i, j] <- est_val
+    yield_p_mat[i, j] <- p_val
+  }
+}
+
+readr::write_csv(
+  as.data.frame(yield_assoc_mat) %>% tibble::rownames_to_column("variable"),
+  "yield_association_matrix.csv"
+)
+
+readr::write_csv(
+  as.data.frame(yield_p_mat) %>% tibble::rownames_to_column("variable"),
+  "yield_association_pvalues.csv"
+)
+
+png("fig_yield_association_matrix.png", width = 1700, height = 1500, res = 220)
+corrplot::corrplot(
+  yield_assoc_mat,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.srt = 45,
+  na.label = " ",
+  mar = c(0, 0, 2, 0),
+  title = "Yield subset mixed-type association matrix"
+)
+dev.off()
+
+```
+# -----------------------------
+# 3. Mini-network association mapping
+# -----------------------------
+```{r}
+yield_net_df <- df_fdx_ph_mod %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    rdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na()
+
+yield_net_cor <- stats::cor(
+  yield_net_df,
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)
+
+yield_net_p <- matrix(
+  NA_real_,
+  nrow = ncol(yield_net_df),
+  ncol = ncol(yield_net_df),
+  dimnames = list(names(yield_net_df), names(yield_net_df))
+)
+
+for (i in seq_len(ncol(yield_net_df))) {
+  for (j in seq_len(ncol(yield_net_df))) {
+    if (i == j) {
+      yield_net_p[i, j] <- 0
+    } else {
+      ct <- suppressWarnings(
+        stats::cor.test(
+          yield_net_df[[i]],
+          yield_net_df[[j]],
+          method = "spearman"
+        )
+      )
+      yield_net_p[i, j] <- ct$p.value
+    }
+  }
+}
+
+yield_edge_tbl <- as.data.frame(as.table(yield_net_cor)) %>%
+  dplyr::rename(from = Var1, to = Var2, weight = Freq) %>%
+  dplyr::mutate(p = as.vector(yield_net_p)) %>%
+  dplyr::filter(from != to) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(pair = paste(sort(c(from, to)), collapse = "__")) %>%
+  dplyr::ungroup() %>%
+  dplyr::distinct(pair, .keep_all = TRUE) %>%
+  dplyr::filter(!is.na(weight), abs(weight) >= 0.10, p < 0.05) %>%
+  dplyr::mutate(
+    layout_weight = abs(weight),
+    sign_class = factor(ifelse(weight > 0, "positive", "negative"),
+                        levels = c("positive", "negative"))
+  )
+
+yield_node_tbl <- tibble::tibble(
+  name = colnames(yield_net_cor),
+  category = factor(
+    c("pathogen", "pathogen", "soil", "disease", "root", "yield"),
+    levels = c("pathogen", "soil", "root", "disease", "yield")
+  )
+)
+
+yield_graph_obj <- tidygraph::tbl_graph(
+  nodes = yield_node_tbl,
+  edges = yield_edge_tbl,
+  directed = FALSE
+)
+
+p_yield_net <- ggraph::ggraph(
+  yield_graph_obj,
+  layout = "fr",
+  weights = layout_weight
+) +
+  ggraph::geom_edge_link(
+    ggplot2::aes(
+      edge_width = abs(weight),
+      edge_alpha = abs(weight),
+      edge_colour = sign_class,
+      edge_linetype = sign_class
+    )
+  ) +
+  ggraph::geom_node_point(
+    ggplot2::aes(shape = category),
+    size = 8
+  ) +
+  ggraph::geom_node_text(
+    ggplot2::aes(label = name),
+    repel = TRUE
+  ) +
+  ggraph::scale_edge_width(range = c(0.5, 2.5)) +
+  ggraph::scale_edge_alpha(range = c(0.4, 0.9)) +
+  ggraph::scale_edge_colour_manual(
+    values = c(
+      positive = "steelblue4",
+      negative = "firebrick3"
+    )
+  ) +
+  ggraph::scale_edge_linetype_manual(
+    values = c(
+      positive = "solid",
+      negative = "dashed"
+    )
+  ) +
+  ggplot2::labs(
+    title = "Yield subset mini-network: pathogen, root disease, foliar disease, soil, and yield"
+  ) +
+  ggplot2::theme_void()
+
+ggplot2::ggsave(
+  "fig_yield_mini_network.png",
+  p_yield_net,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+```
+
+# -----------------------------
+# 4. PCA
+# -----------------------------
+```{r}
+#-----------------------------
+# Shared PCA input with manuscript-style names
+#-----------------------------
+yield_pca_df <- df %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    rdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na() %>%
+  dplyr::rename(
+    "F. virguliforme" = ratio_fvfg_dnang,
+    "SCN density"                   = scn_count_rep,
+    "Soil pH"                       = soil_ph,
+    "FDX"                           = fdx,
+    "RDX"                           = rdx,
+    "Yield"                         = yield_kgha
+  )
+
+yield_pca_res <- FactoMineR::PCA(
+  yield_pca_df,
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+yield_pca_loadings <- as.data.frame(yield_pca_res$var$coord) %>%
+  tibble::rownames_to_column("variable")
+
+readr::write_csv(yield_pca_loadings, "yield_pca_loadings.csv")
+
+#-----------------------------
+# Scree plot
+#-----------------------------
+p_yield_scree <- factoextra::fviz_eig(yield_pca_res, addlabels = TRUE) +
+  ggplot2::labs(
+    title = "Yield subset PCA scree plot",
+    x = "Principal components",
+    y = "Percentage of explained variance"
+  ) +
+  theme_siteyear
+
+ggplot2::ggsave(
+  "fig_yield_pca_scree.png",
+  p_yield_scree,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+#-----------------------------
+# PCA biplot by FDX level
+#-----------------------------
+yield_pca_fdxlvl <- df_fdx_ph_mod %>%
+  dplyr::select(
+    fdx_level,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    rdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na() %>%
+  dplyr::mutate(
+    fdx_level = factor(
+      fdx_level,
+      levels = c("none", "low", "high"),
+      labels = c("None (FDX = 0)", "Low (0 < FDX < 10)", "High (FDX ≥ 10)")
+    )
+  ) %>%
+  dplyr::rename(
+    "F. virguliforme" = ratio_fvfg_dnang,
+    "SCN density"                   = scn_count_rep,
+    "Soil pH"                       = soil_ph,
+    "FDX"                           = fdx,
+    "RDX"                           = rdx,
+    "Yield"                         = yield_kgha
+  )
+
+yield_pca_res_fdxlvl <- FactoMineR::PCA(
+  yield_pca_fdxlvl %>% dplyr::select(-fdx_level),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+fdx_labels<-c("None (FDX = 0)", "Low (0 < FDX < 10)", "High (FDX ≥ 10)")
+fdx_cols<-c( "#00BA38", "#B79F00", "#F8766D")
+
+# Base plot without variable labels
+p_base <- factoextra::fviz_pca_biplot(
+  yield_pca_res_fdxlvl,
+  geom.ind = "point",
+  habillage = yield_pca_fdxlvl$fdx_level,
+  addEllipses = TRUE,
+  ellipse.alpha = 0.05,
+  ellipse.level = 0.95,
+  label = "none",
+  col.var = "black",
+  arrowsize = 0.5,
+  pointshape = 16,
+  pointsize = 1.25,
+  alpha.ind = 0.65,
+  palette = fdx_cols
+) 
+
+# Find the layer that contains the displayed arrow endpoints
+gb <- ggplot_build(p_base)
+arrow_layer_idx <- which(vapply(
+  gb$data,
+  function(d) all(c("x", "y", "xend", "yend") %in% names(d)),
+  logical(1)
+))[1]
+
+arrow_df <- gb$data[[arrow_layer_idx]]
+
+# Use the variable order from the PCA object
+var_names <- rownames(yield_pca_res_fdxlvl$var$coord)
+
+var_df <- dplyr::tibble(
+  variable = var_names,
+  x = arrow_df$xend * 1.04,
+  y = arrow_df$yend * 1.04,
+  hjust = dplyr::if_else(arrow_df$xend >= 0, 0, 1),
+  vjust = dplyr::if_else(arrow_df$yend >= 0, 0, 1)
+) %>%
+  dplyr::mutate(
+    lab = dplyr::case_when(
+      variable == "F. virguliforme" ~ "F. virguliforme",
+      TRUE ~ variable
+    )
+  )
+
+var_df <- var_df %>%
+  dplyr::mutate(
+    x = dplyr::case_when(
+      variable == "Soil pH" ~ x - 0.35,
+      variable == "FDX"     ~ x - 0.20,
+      variable == "RDX"     ~ x + 0.15,
+      variable == "F. virguliforme" ~ x + 0.5,
+      TRUE ~ x
+    ),
+    y = dplyr::case_when(
+      variable == "Soil pH" ~ y + 0.10,
+      variable == "FDX"     ~ y + 0.18,
+      variable == "RDX"     ~ y - 0.08,
+      TRUE ~ y
+    )
+  )
+
+p_yield_pca_fdxlvl <- p_base +
+  theme_siteyear +
+  ggplot2::theme(
+    legend.title = element_text(size = 11),
+    legend.key.size = grid::unit(0.6, "cm")
+  ) +
+  scale_color_manual(
+  values = fdx_cols,
+  labels = fdx_labels,
+  name = expression(atop("Foliar disease", "(FDX) level")),
+  drop = FALSE
+  ) +
+  scale_fill_manual(
+    values = fdx_cols,
+    labels = fdx_labels,
+    name = expression(atop("Foliar disease", "(FDX) level")),
+    drop = FALSE,
+    guide = "none"
+  ) +
+  coord_cartesian(xlim = c(-6.0, 6.0),ylim=c(-4.0,4.0)) +
+  ggplot2::geom_text(
+    data = var_df,
+    aes(x = x, y = y, label = lab, hjust = hjust, vjust = vjust),
+    inherit.aes = FALSE,
+    size = 4,
+    color = "black"
+  ) +
+  ggplot2::labs(
+    title = "PCA biplot by FDX level",
+    x = paste0("PC1 (", round(yield_pca_res_fdxlvl$eig[1, 2], 1), "% variance)"),
+    y = paste0("PC2 (", round(yield_pca_res_fdxlvl$eig[2, 2], 1), "% variance)")
+  )
+
+ggplot2::ggsave(
+  "fig_yield_pca_biplot_fdx_level.png",
+  p_yield_pca_fdxlvl,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+#-----------------------------
+# PCA biplot by SCN level
+#-----------------------------
+yield_pca_scn <- df %>%
+  dplyr::select(
+    scn_level,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    rdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na() %>%
+  dplyr::filter(!is.na(scn_level)) %>%
+  dplyr::mutate(
+    scn_level = factor(
+      scn_level,
+      levels = c("none","low", "high"),
+      labels = c("No SCN", "Low SCN", "High SCN")
+    )
+  ) %>%
+  dplyr::rename(
+    "F. virguliforme" = ratio_fvfg_dnang,
+    "SCN density"                   = scn_count_rep,
+    "Soil pH"                       = soil_ph,
+    "FDX"                           = fdx,
+    "RDX"                           = rdx,
+    "Yield"                         = yield_kgha
+  )
+
+yield_pca_res_scn <- FactoMineR::PCA(
+  yield_pca_scn %>% dplyr::select(-scn_level),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+scn_labels <- c(
+  "No SCN"   = "No SCN detected",
+  "Low SCN" = expression("Low SCN (" * "eggs + J2∙100" * cm^{3} * ")"),
+  "High SCN"  = expression("High SCN (" * "egs + J2∙100" * cm^{3} * ")")
+)
+
+scn_cols <- c(
+  "No SCN"   = "#00BA38",   #
+  "Low SCN" = "#B79F00",   # 
+  "High SCN" = "#F8766D"   # 
+)
+
+p_yield_pca_scn <- factoextra::fviz_pca_biplot(
+  yield_pca_res_scn,
+  geom.ind = "point",
+  habillage = yield_pca_scn$scn_level,
+  addEllipses = TRUE,
+  ellipse.alpha = 0.05,
+  ellipse.level = 0.95,
+  label = "none",
+  col.var = "black",
+  arrowsize = 0.5,
+  pointshape = 16,
+  pointsize = 1.25,
+  alpha.ind = 0.65,
+  palette = scn_cols
+)  
+
+# Base plot without variable labels
+p_base <- factoextra::fviz_pca_biplot(
+  yield_pca_res_scn,
+  geom.ind = "point",
+  habillage = yield_pca_scn$scn_level,
+  addEllipses = TRUE,
+  ellipse.alpha = 0.05,
+  ellipse.level = 0.95,
+  label = "none",
+  col.var = "black",
+  arrowsize = 0.5,
+  pointshape = 16,
+  pointsize = 1.25,
+  alpha.ind = 0.65,
+  palette = scn_cols
+) 
+
+# Find the layer that contains the displayed arrow endpoints
+gb <- ggplot_build(p_base)
+arrow_layer_idx <- which(vapply(
+  gb$data,
+  function(d) all(c("x", "y", "xend", "yend") %in% names(d)),
+  logical(1)
+))[1]
+
+arrow_df <- gb$data[[arrow_layer_idx]]
+
+# Use the variable order from the PCA object
+var_names <- rownames(yield_pca_res_scn$var$coord)
+
+var_df <- dplyr::tibble(
+  variable = var_names,
+  x = arrow_df$xend * 1.04,
+  y = arrow_df$yend * 1.04,
+  hjust = dplyr::if_else(arrow_df$xend >= 0, 0, 1),
+  vjust = dplyr::if_else(arrow_df$yend >= 0, 0, 1)
+) %>%
+  dplyr::mutate(
+    lab = dplyr::case_when(
+      variable == "F. virguliforme" ~ "F. virguliforme",
+      TRUE ~ variable
+    )
+  )
+
+var_df <- var_df %>%
+  dplyr::mutate(
+    x = dplyr::case_when(
+      variable == "Soil pH" ~ x - 0.35,
+      variable == "FDX"     ~ x - 0.20,
+      variable == "RDX"     ~ x + 0.15,
+      variable == "F. virguliforme" ~ x + 0.5,
+      TRUE ~ x
+    ),
+    y = dplyr::case_when(
+      variable == "Soil pH" ~ y + 0.10,
+      variable == "FDX"     ~ y + 0.18,
+      variable == "RDX"     ~ y - 0.08,
+      TRUE ~ y
+    )
+  )
+
+p_yield_pca_scn <- p_base +
+  theme_siteyear +
+  ggplot2::theme(
+    legend.title = element_text(size = 11),
+    legend.key.size = grid::unit(0.6, "cm")
+  ) +
+  scale_color_manual(
+  values = scn_cols,
+  labels = scn_labels,
+  name = expression(atop(italic("Heterodera glycines"),
+                           "(SCN) density level")),
+  drop = FALSE
+  ) +
+  scale_fill_manual(
+    values = scn_cols,
+    labels = scn_labels,
+    name = expression(atop(italic("Heterodera glycines"),
+                           "(SCN) density level")),
+    drop = FALSE,
+    guide = "none"
+  ) +
+  coord_cartesian(xlim = c(-6.0, 6.0),ylim=c(-4.0,4.0)) +
+  ggplot2::geom_text(
+    data = var_df,
+    aes(x = x, y = y, label = lab, hjust = hjust, vjust = vjust),
+    inherit.aes = FALSE,
+    size = 4,
+    color = "black"
+  ) +
+  ggplot2::labs(
+    title = "PCA biplot by SCN level",
+    x = paste0("PC1 (", round(yield_pca_res_scn$eig[1, 2], 1), "% variance)"),
+    y = paste0("PC2 (", round(yield_pca_res_scn$eig[2, 2], 1), "% variance)")
+  )
+
+ggplot2::ggsave(
+  "fig_yield_pca_biplot_scn_level.png",
+  p_yield_pca_scn,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+#-----------------------------
+# PCA biplot by simplified Fv class
+# Strict numeric alignment:
+# 0, 0-1, 1-3, 3-5, >5
+#-----------------------------
+yield_pca_fv_simple <- df_fdx_ph_mod %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    rdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na() %>%
+  dplyr::mutate(
+    fv_level_simple = dplyr::case_when(
+      ratio_fvfg_dnang == 0 ~ "0",
+      ratio_fvfg_dnang > 0 & ratio_fvfg_dnang < 1 ~ "0-1",
+      ratio_fvfg_dnang >= 1 & ratio_fvfg_dnang < 3 ~ "1-3",
+      ratio_fvfg_dnang >= 3 & ratio_fvfg_dnang < 5 ~ "3-5",
+      ratio_fvfg_dnang >= 5 ~ ">5"
+    ),
+    fv_level_simple = factor(
+      fv_level_simple,
+      levels = c("0", "0-1", "1-3", "3-5", ">5")
+    )
+  ) %>%
+  dplyr::rename(
+    "F. virguliforme" = ratio_fvfg_dnang,
+    "SCN density"     = scn_count_rep,
+    "Soil pH"         = soil_ph,
+    "FDX"             = fdx,
+    "RDX"             = rdx,
+    "Yield"           = yield_kgha
+  )
+
+yield_pca_res_fv_simple <- FactoMineR::PCA(
+  yield_pca_fv_simple %>% dplyr::select(-fv_level_simple),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+fv_labels <- c(
+  "0"   = "0 (undetected)",
+  "0-1" = expression("Low (" * "0–1" ~ fg %.% ng^{-1} * ")"),
+  "1-3" = expression("Moderate (" * "1–3" ~ fg %.% ng^{-1} * ")"),
+  "3-5" = expression("Moderate-High (" * "3–5" ~ fg %.% ng^{-1} * ")"),
+  ">5"  = expression("High (" * ">" * 5 ~ fg %.% ng^{-1} * ")")
+)
+
+
+fv_cols <- c(
+  "0"   = "#4169E1",   # royal blue
+  "0-1" = "#00A651",   # darker green
+  "1-3" = "#C49A25",   # deeper gold
+  "3-5" = "#E26B20",   # red-orange
+  ">5"  = "#850101"    # deep red
+)
+
+# Base plot without variable labels
+p_base <- factoextra::fviz_pca_biplot(
+  yield_pca_res_fv_simple,
+  geom.ind = "point",
+  habillage = yield_pca_fv_simple$fv_level_simple,
+  addEllipses = TRUE,
+  ellipse.alpha = 0.05,
+  ellipse.level = 0.95,
+  label = "none",
+  col.var = "black",
+  arrowsize = 0.5,
+  pointshape = 16,
+  pointsize = 1.25,
+  alpha.ind = 0.65,
+  palette = fv_cols
+)
+
+# Find the layer that contains the displayed arrow endpoints
+gb <- ggplot_build(p_base)
+arrow_layer_idx <- which(vapply(
+  gb$data,
+  function(d) all(c("x", "y", "xend", "yend") %in% names(d)),
+  logical(1)
+))[1]
+
+arrow_df <- gb$data[[arrow_layer_idx]]
+
+# Use the variable order from the PCA object
+var_names <- rownames(yield_pca_res_fv_simple$var$coord)
+
+var_df <- dplyr::tibble(
+  variable = var_names,
+  x = arrow_df$xend * 1.04,
+  y = arrow_df$yend * 1.04,
+  hjust = dplyr::if_else(arrow_df$xend >= 0, 0, 1),
+  vjust = dplyr::if_else(arrow_df$yend >= 0, 0, 1)
+) %>%
+  dplyr::mutate(
+    lab = dplyr::case_when(
+      variable == "F. virguliforme" ~ "F. virguliforme",
+      TRUE ~ variable
+    )
+  )
+
+var_df <- var_df %>%
+  dplyr::mutate(
+    x = dplyr::case_when(
+      variable == "Soil pH" ~ x - 0.35,
+      variable == "FDX"     ~ x - 0.20,
+      variable == "RDX"     ~ x + 0.15,
+      variable == "F. virguliforme" ~ x + 0.5,
+      TRUE ~ x
+    ),
+    y = dplyr::case_when(
+      variable == "Soil pH" ~ y + 0.10,
+      variable == "FDX"     ~ y + 0.18,
+      variable == "RDX"     ~ y - 0.08,
+      TRUE ~ y
+    )
+  )
+
+p_yield_pca_fv_simple <- p_base +
+  theme_siteyear +
+  ggplot2::theme(
+    legend.title = element_text(size = 11),
+    legend.key.size = grid::unit(0.6, "cm")
+  ) +
+  scale_color_manual(
+    values = fv_cols,
+    labels = fv_labels,
+    name = expression(atop(italic("Fusarium virguliforme"),
+                           "DNA abundance level")),
+    drop = FALSE
+  ) +
+  scale_fill_manual(
+    values = fv_cols,
+    labels = fv_labels,
+    name = expression(atop(italic("F. virguliforme"),
+                           "DNA abundance level")),
+    drop = FALSE,
+    guide = "none"
+  ) +
+  coord_cartesian(xlim = c(-6.0, 6.0),ylim=c(-4.0,4.0)) +
+  ggplot2::geom_text(
+    data = var_df,
+    aes(x = x, y = y, label = lab, hjust = hjust, vjust = vjust),
+    inherit.aes = FALSE,
+    size = 4,
+    color = "black"
+  ) +
+  ggplot2::labs(
+    title = expression(paste(
+    "PCA biplot by ", italic("Fusarium virguliforme"), " DNA abundance level"
+  )),
+    x = paste0("PC1 (", round(yield_pca_res_fv_simple$eig[1, 2], 1), "% variance)"),
+    y = paste0("PC2 (", round(yield_pca_res_fv_simple$eig[2, 2], 1), "% variance)")
+  )
+
+ggplot2::ggsave(
+  "fig_yield_pca_biplot_fv_simple.png",
+  p_yield_pca_fv_simple,
+  width = 8,
+  height = 6,
+  dpi = 600
+)
+
+#-----------------------------
+# PCA biplot by product
+#-----------------------------
+yield_pca_prod <- df %>%
+  dplyr::select(
+    product,
+    ratio_fvfg_dnang,
+    scn_count_rep,
+    soil_ph,
+    fdx,
+    rdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na() %>%
+  dplyr::mutate(
+    product = factor(
+      product,
+      levels = c("Base", "ILEVO", "Saltro"),
+      labels = c("CB", "CB + fluopyram", "CB + pydiflumetofen")
+    )
+  ) %>%
+  dplyr::rename(
+    "F. virguliforme" = ratio_fvfg_dnang,
+    "SCN density"                   = scn_count_rep,
+    "Soil pH"                       = soil_ph,
+    "FDX"                           = fdx,
+    "RDX"                           = rdx,
+    "Yield"                         = yield_kgha
+  )
+
+yield_pca_res_prod <- FactoMineR::PCA(
+  yield_pca_prod %>% dplyr::select(-product),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+trt_cols<-c("#F8766D", "#00BA38", "#619CFF")
+trt_labels<-c("CB", "CB + fluopyram", "CB + pydiflumetofen")
+
+p_yield_pca_prod <- factoextra::fviz_pca_biplot(
+  yield_pca_res_prod,
+  geom.ind = "point",
+  habillage = yield_pca_prod$product,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  label = "var",
+  repel = TRUE,
+  col.var = "black",
+  arrowsize = 0.7,
+  pointshape = 16,
+  pointsize = 2.2,
+  alpha.ind = 0.65,
+  palette = trt_cols
+) 
+
+# Base plot without variable labels
+p_base <- factoextra::fviz_pca_biplot(
+  yield_pca_res_prod,
+  geom.ind = "point",
+  habillage = yield_pca_prod$product,
+  addEllipses = TRUE,
+  ellipse.alpha = 0.05,
+  ellipse.level = 0.95,
+  label = "none",
+  col.var = "black",
+  arrowsize = 0.5,
+  pointshape = 16,
+  pointsize = 1.25,
+  alpha.ind = 0.65,
+  palette = trt_cols
+) 
+
+# Find the layer that contains the displayed arrow endpoints
+gb <- ggplot_build(p_base)
+arrow_layer_idx <- which(vapply(
+  gb$data,
+  function(d) all(c("x", "y", "xend", "yend") %in% names(d)),
+  logical(1)
+))[1]
+
+arrow_df <- gb$data[[arrow_layer_idx]]
+
+# Use the variable order from the PCA object
+var_names <- rownames(yield_pca_res_prod$var$coord)
+
+var_df <- dplyr::tibble(
+  variable = var_names,
+  x = arrow_df$xend * 1.04,
+  y = arrow_df$yend * 1.04,
+  hjust = dplyr::if_else(arrow_df$xend >= 0, 0, 1),
+  vjust = dplyr::if_else(arrow_df$yend >= 0, 0, 1)
+) %>%
+  dplyr::mutate(
+    lab = dplyr::case_when(
+      variable == "F. virguliforme" ~ "F. virguliforme",
+      TRUE ~ variable
+    )
+  )
+
+var_df <- var_df %>%
+  dplyr::mutate(
+    x = dplyr::case_when(
+      variable == "Soil pH" ~ x - 0.35,
+      variable == "FDX"     ~ x - 0.20,
+      variable == "RDX"     ~ x + 0.15,
+      variable == "F. virguliforme" ~ x + 0.5,
+      TRUE ~ x
+    ),
+    y = dplyr::case_when(
+      variable == "Soil pH" ~ y + 0.10,
+      variable == "FDX"     ~ y + 0.18,
+      variable == "RDX"     ~ y - 0.08,
+      TRUE ~ y
+    )
+  )
+
+p_yield_pca_prod <- p_base +
+  theme_siteyear +
+  ggplot2::theme(
+    legend.title = element_text(size = 11),
+    legend.key.size = grid::unit(0.6, "cm")
+  ) +
+  scale_color_manual(
+  values = trt_cols,
+  labels = trt_labels,
+  name = c("Seed treatment"),
+  drop = FALSE
+  ) +
+  scale_fill_manual(
+    values = trt_cols,
+    labels = trt_labels,
+    name = c("Seed treatment"),
+    drop = FALSE,
+    guide = "none"
+  ) +
+  coord_cartesian(xlim = c(-6.0, 6.0),ylim=c(-4.0,4.0)) +
+  ggplot2::geom_text(
+    data = var_df,
+    aes(x = x, y = y, label = lab, hjust = hjust, vjust = vjust),
+    inherit.aes = FALSE,
+    size = 4,
+    color = "black"
+  ) +
+    ggplot2::labs(
+    title = "Yield subset PCA biplot by seed treatment product",
+    x = paste0("PC1 (", round(yield_pca_res_prod$eig[1, 2], 1), "% variance)"),
+    y = paste0("PC2 (", round(yield_pca_res_prod$eig[2, 2], 1), "% variance)")
+  )
+
+ggplot2::ggsave(
+  "fig_yield_pca_biplot_product.png",
+  p_yield_pca_prod,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+#-----------------------------
+# PCA loadings bar plot for first 4 PCs
+#-----------------------------
+pc_var <- yield_pca_res_fv_simple$eig[1:4, 2]  # % variance
+pc_labels <- paste0(
+  "PC", 1:4, " (", sprintf("%.1f", pc_var), "%)"
+)
+
+# Extract loadings
+yield_pca_loadings_plot <- as.data.frame(yield_pca_res_fv_simple$var$coord) %>%
+  tibble::rownames_to_column("variable") %>%
+  dplyr::filter(
+    !is.na(variable),
+    variable != "",
+    variable != "NA"
+  ) %>%
+  dplyr::select(variable, Dim.1, Dim.2, Dim.3, Dim.4) %>%
+  dplyr::rename(
+    PC1 = Dim.1,
+    PC2 = Dim.2,
+    PC3 = Dim.3,
+    PC4 = Dim.4
+  ) %>%
+  tidyr::pivot_longer(
+    cols = starts_with("PC"),
+    names_to = "PC",
+    values_to = "loading"
+  ) %>%
+  dplyr::filter(!is.na(loading)) %>%
+  dplyr::mutate(
+    PC = factor(
+      PC,
+      levels = c("PC1", "PC2", "PC3", "PC4"),
+      labels = pc_labels
+    ),
+    variable = factor(
+      variable,
+      levels = c("F. virguliforme", "SCN density", "Soil pH", "FDX", "RDX", "Yield")
+    ),
+    loading_sign = dplyr::if_else(loading < 0, "Negative", "Positive")
+  ) %>%
+  droplevels()
+
+unique(as.data.frame(yield_pca_res_fv_simple$var$coord) %>%
+  tibble::rownames_to_column("variable") %>%
+  dplyr::pull(variable))
+
+table(as.data.frame(yield_pca_res_fv_simple$var$coord) %>%
+  tibble::rownames_to_column("variable") %>%
+  dplyr::pull(variable), useNA = "ifany")
+
+yield_pca_loadings_plot <- yield_pca_loadings_plot %>%
+  dplyr::filter(!is.na(variable) & as.character(variable) != "NA")
+
+# Plot
+p_yield_pca_loadings <- ggplot(
+  yield_pca_loadings_plot,
+  aes(x = loading, y = forcats::fct_rev(variable), fill = loading)
+) +
+  geom_col(width = 0.75, color = "black", linewidth = 0.25) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  facet_wrap(~ PC, ncol = 2, scales = "fixed") +
+  scale_fill_gradient2(
+    low = "#B2182B",   # red = negative
+    mid = "white",
+    high = "#2166AC",  # blue = positive
+    midpoint = 0,
+    name = "Loading"
+  ) +
+  geom_text(
+  aes(label = sprintf(" %.2f", loading),
+      hjust = if_else(loading < 0, 1.05, -0.05)),
+  size = 3
+  ) +
+  coord_cartesian(xlim = c(-1.1, 1.1)) +
+  labs(
+    title = "PCA variable loadings for the first four principal components",
+    x = "Loading",
+    y = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(linewidth = 0.2),
+    plot.title = element_text(face = "bold", size = 12),
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    legend.position = "right"
+  )
+
+p_yield_pca_loadings
+
+ggsave(
+  "fig_yield_pca_loadings_barplot.png",
+  p_yield_pca_loadings,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+library(patchwork)
+
+p_sup <- (
+  p_yield_pca_fdxlvl +
+    ggtitle("A") +
+    theme(plot.title = element_text(size = 16, hjust = 0, face = "bold"))
+) +
+(
+  p_yield_pca_scn +
+    ggtitle("B") +
+    theme(plot.title = element_text(size = 16, hjust = 0, face = "bold"))
+) +
+(
+  p_yield_pca_prod +
+    ggtitle("C") +
+    theme(plot.title = element_text(size = 16, hjust = 0, face = "bold"))
+) +
+(
+  p_yield_pca_loadings +
+    ggtitle("D") +
+    theme(plot.title = element_text(size = 16, hjust = 0, face = "bold"))
+) +
+plot_layout(ncol = 2)
+
+ggsave(
+  "fig_pca_supplemental.png",
+  p_sup,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+
+eig <- yield_pca_res_fv_simple$eig
+
+pc3_var <- eig[3, "percentage of variance"]
+pc4_var <- eig[4, "percentage of variance"]
+pc34_sum <- pc3_var + pc4_var
+
+loadings <- as.data.frame(yield_pca_res_fv_simple$var$coord)
+
+loadings$variable <- rownames(loadings)
+
+loadings %>%
+  select(variable, Dim.1, Dim.2, Dim.3, Dim.4)
+
+loadings %>%
+  arrange(desc(abs(Dim.3))) %>% head()
+
+
+eig <- yield_pca_res_fv_simple$eig
+
+pc3 <- eig[3, "percentage of variance"]
+pc4 <- eig[4, "percentage of variance"]
+pc34 <- pc3 + pc4
+
+pc3; pc4; pc34
+
+
+```
+
+
+
+#### corr matrices ####
+```{r}
+#========================================================
+# Final polished publication chunk:
+# heterogeneous core matrix + full mixed-type matrix
+# with validation pairs, no identity diagonal,
+# manual diagonal labels for clean placement
+#========================================================
+
+#--------------------------------------------------------
+# Options / toggles
+#--------------------------------------------------------
+SHOW_TYPE_CODES_CORE <- TRUE
+SHOW_TYPE_CODES_FULL <- TRUE
+HIGHLIGHT_VALIDATION_PAIRS <- TRUE
+
+#--------------------------------------------------------
+# Helper functions
+#--------------------------------------------------------
+is_binary_factor <- function(x) is.factor(x) && nlevels(x) == 2
+is_ordinal       <- function(x) is.ordered(x)
+is_unordered     <- function(x) is.factor(x) && !is_ordinal(x)
+
+eta_with_p <- function(num, fac) {
+  fac <- droplevels(fac)
+  ok <- !is.na(num) & !is.na(fac)
+  num <- num[ok]
+  fac <- fac[ok]
+
+  if (length(num) < 2 || nlevels(fac) < 2) {
+    return(list(stat = NA_real_, p = NA_real_))
+  }
+
+  fit <- aov(num ~ fac)
+  tb  <- summary(fit)[[1]]
+  SS_g <- tb["fac", "Sum Sq"]
+  SS_e <- tb["Residuals", "Sum Sq"]
+  eta2p <- SS_g / (SS_g + SS_e)
+
+  list(
+    stat = sqrt(max(0, eta2p)),
+    p    = tb["fac", "Pr(>F)"]
+  )
+}
+
+cramer_v <- function(x, y) {
+  tab <- table(x, y)
+  chi <- suppressWarnings(chisq.test(tab, correct = FALSE))
+  n   <- sum(tab)
+  r   <- nrow(tab)
+  c   <- ncol(tab)
+  V   <- sqrt(as.numeric(chi$statistic) / (n * (min(r, c) - 1)))
+  list(stat = V, p = chi$p.value)
+}
+
+poly_serial_safe <- function(x, ord) {
+  if (requireNamespace("polycor", quietly = TRUE)) {
+    out <- try(polycor::polyserial(x, as.ordered(ord)), silent = TRUE)
+    if (!inherits(out, "try-error")) {
+      return(list(stat = as.numeric(out), p = NA_real_))
+    }
+  }
+
+  z  <- suppressWarnings(as.numeric(ord))
+  ct <- suppressWarnings(cor.test(x, z))
+  list(stat = unname(ct$estimate), p = unname(ct$p.value))
+}
+
+poly_choric_safe <- function(x, y) {
+  if (requireNamespace("polycor", quietly = TRUE)) {
+    out <- try(
+      polycor::polychor(as.ordered(x), as.ordered(y), ML = TRUE, std.err = TRUE),
+      silent = TRUE
+    )
+    if (!inherits(out, "try-error") && !is.null(attr(out, "std.err"))) {
+      rho <- as.numeric(out)
+      se  <- attr(out, "std.err")
+      z   <- rho / se
+      p   <- 2 * pnorm(-abs(z))
+      return(list(stat = rho, p = p))
+    }
+  }
+
+  cramer_v(as.factor(x), as.factor(y))
+}
+
+assoc_pair <- function(x, y) {
+
+  if (is.numeric(x) && is.numeric(y)) {
+    ct <- suppressWarnings(cor.test(x, y, method = "spearman", exact = FALSE))
+    return(list(stat = unname(ct$estimate), p = unname(ct$p.value), type = "r"))
+  }
+
+  if (is.numeric(x) && is_binary_factor(y)) {
+    b  <- as.numeric(y) - 1
+    ct <- suppressWarnings(cor.test(x, b))
+    return(list(stat = unname(ct$estimate), p = unname(ct$p.value), type = "pb"))
+  }
+
+  if (is.numeric(y) && is_binary_factor(x)) {
+    b  <- as.numeric(x) - 1
+    ct <- suppressWarnings(cor.test(y, b))
+    return(list(stat = unname(ct$estimate), p = unname(ct$p.value), type = "pb"))
+  }
+
+  if (is.numeric(x) && is_unordered(y) && nlevels(y) > 2) {
+    res <- eta_with_p(x, y)
+    return(list(stat = res$stat, p = res$p, type = "η"))
+  }
+
+  if (is.numeric(y) && is_unordered(x) && nlevels(x) > 2) {
+    res <- eta_with_p(y, x)
+    return(list(stat = res$stat, p = res$p, type = "η"))
+  }
+
+  if (is.numeric(x) && is_ordinal(y)) {
+    res <- poly_serial_safe(x, y)
+    return(list(stat = res$stat, p = res$p, type = "ps"))
+  }
+
+  if (is.numeric(y) && is_ordinal(x)) {
+    res <- poly_serial_safe(y, x)
+    return(list(stat = res$stat, p = res$p, type = "ps"))
+  }
+
+  if (is_ordinal(x) && is_ordinal(y)) {
+    res <- poly_choric_safe(x, y)
+    return(list(stat = res$stat, p = res$p, type = "pc"))
+  }
+
+  res <- cramer_v(as.factor(x), as.factor(y))
+  list(stat = res$stat, p = res$p, type = "V")
+}
+
+#--------------------------------------------------------
+# Build correlation-ready dataframe with stratification vars
+#--------------------------------------------------------
+df_corr <- df %>%
+  dplyr::mutate(
+    fv_level = dplyr::case_when(
+      ratio_fvfg_dnang == 0 ~ "0",
+      ratio_fvfg_dnang > 0 & ratio_fvfg_dnang < 1 ~ "0–1",
+      ratio_fvfg_dnang >= 1 & ratio_fvfg_dnang < 3 ~ "1–3",
+      ratio_fvfg_dnang >= 3 & ratio_fvfg_dnang < 5 ~ "3–5",
+      ratio_fvfg_dnang >= 5 ~ ">5"
+    ),
+    fv_level = factor(fv_level, levels = c("0", "0–1", "1–3", "3–5", ">5")),
+
+    scn_level = dplyr::case_when(
+      scn_count_rep == 0 ~ "None",
+      scn_count_rep > 0 & scn_count_rep < 2000 ~ "Low",
+      scn_count_rep >= 2000 ~ "High"
+    ),
+    scn_level = factor(scn_level, levels = c("None", "Low", "High")),
+
+    fdx_level = dplyr::case_when(
+      fdx == 0 ~ "None",
+      fdx > 0 & fdx < 10 ~ "Low",
+      fdx >= 10 ~ "High"
+    ),
+    fdx_level = factor(fdx_level, levels = c("None", "Low", "High")),
+
+    sds_tol = factor(sds_tol),
+    product = factor(product)
+  )
+
+#--------------------------------------------------------
+# Shared helper to build pairwise association dataframe
+#--------------------------------------------------------
+build_assoc_df <- function(dat, var_names) {
+  expand.grid(
+    var1 = var_names,
+    var2 = var_names,
+    stringsAsFactors = FALSE
+  ) %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+      res = list(assoc_pair(dat[[var1]], dat[[var2]])),
+      coef = res$stat,
+      p    = res$p,
+      type = res$type
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      sig = dplyr::case_when(
+        !is.na(p) & p < 0.001 ~ "***",
+        !is.na(p) & p < 0.01  ~ "**",
+        !is.na(p) & p < 0.05  ~ "*",
+        TRUE                  ~ ""
+      ),
+      coef_lab = sprintf("%.2f", coef),
+      type_lab = dplyr::case_when(
+        type %in% c("r", "pb", "η", "ps", "pc", "V") ~ type,
+        TRUE ~ ""
+      )
+    )
+}
+
+#--------------------------------------------------------
+# Shared helper for validation pair flagging
+#--------------------------------------------------------
+flag_validation_pairs <- function(df_assoc) {
+  df_assoc %>%
+    dplyr::mutate(
+      validation_pair = dplyr::case_when(
+        (var1 == "F. virguliforme" & var2 == "Fv level") |
+          (var2 == "F. virguliforme" & var1 == "Fv level") ~ TRUE,
+
+        (var1 == "SCN density" & var2 == "SCN level") |
+          (var2 == "SCN density" & var1 == "SCN level") ~ TRUE,
+
+        (var1 == "FDX" & var2 == "FDX level") |
+          (var2 == "FDX" & var1 == "FDX level") ~ TRUE,
+
+        TRUE ~ FALSE
+      )
+    )
+}
+
+#--------------------------------------------------------
+# Shared plotting helper
+#--------------------------------------------------------
+plot_assoc_matrix_gg <- function(df_assoc,
+                                 var_names,
+                                 title_text,
+                                 fill_title = "Association",
+                                 show_type_codes = TRUE,
+                                 highlight_validation_pairs = TRUE,
+                                 x_limits = NULL,
+                                 y_limits = NULL,
+                                 value_size = 3.8,
+                                 type_size  = 2.5,
+                                 star_size  = 3.2) {
+
+  n_vars <- length(var_names)
+
+  df_plot <- df_assoc %>%
+    dplyr::mutate(
+      row_id = match(var1, var_names),
+      col_id = match(var2, var_names),
+      x = col_id,
+      y = n_vars - row_id + 1
+    ) %>%
+    dplyr::mutate(
+      keep_cell =
+        (row_id < col_id) |
+        (validation_pair & row_id == col_id - 1)
+    ) %>%
+    dplyr::filter(keep_cell)
+
+  if (is.null(x_limits)) x_limits <- c(-0.8, n_vars + 0.9)
+  if (is.null(y_limits)) y_limits <- c(0.2, n_vars + 1.15)
+
+  p <- ggplot() +
+    geom_tile(
+      data = df_plot,
+      aes(
+        x = x,
+        y = y,
+        fill = coef,
+        color = if (highlight_validation_pairs) validation_pair else FALSE
+      ),
+      linewidth = if (highlight_validation_pairs) 0.95 else 0.5,
+      width = 0.98,
+      height = 0.98
+    ) +
+    geom_text(
+      data = df_plot,
+      aes(x = x, y = y, label = coef_lab),
+      size = value_size,
+      fontface = "bold"
+    ) +
+    geom_text(
+      data = df_plot,
+      aes(x = x, y = y, label = sig),
+      nudge_y = -0.28,
+      size = star_size
+    ) +
+    scale_fill_gradient2(
+      low = "#B2182B",
+      mid = "white",
+      high = "#2166AC",
+      midpoint = 0,
+      limits = c(-1, 1),
+      name = fill_title
+    ) +
+    scale_color_manual(
+      values = c("TRUE" = "black", "FALSE" = "white"),
+      guide = "none"
+    ) +
+    scale_x_continuous(
+      limits = x_limits,
+      breaks = NULL,
+      expand = c(0, 0)
+    ) +
+    scale_y_continuous(
+      limits = y_limits,
+      breaks = NULL,
+      expand = c(0, 0)
+    ) +
+    labs(
+      title = title_text,
+      x = NULL,
+      y = NULL
+    ) +
+    coord_fixed(clip = "off") +
+    theme_bw(base_size = 12) +
+    theme(
+      panel.grid = element_blank(),
+      panel.border = element_blank(),
+      plot.title = element_text(face = "bold", size = 12, margin = margin(0, 0, 45, 0)),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      legend.title = element_text(face = "bold"),
+      plot.margin = margin(10, 30, 10, 30),
+      legend.margin = margin(0, 0, 0, 0)
+        )
+
+  if (show_type_codes) {
+    p <- p +
+      geom_text(
+        data = df_plot,
+        aes(x = x, y = y, label = type_lab),
+        nudge_x = -0.36,
+        nudge_y = 0.30,
+        hjust = 0,
+        vjust = 1,
+        size = type_size,
+        color = "black"
+      )
+  }
+
+  p
+}
+
+
+#========================================================
+# 1. CORE MATRIX
+#========================================================
+corr_vars_core <- df_corr %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    fv_level,
+    scn_count_rep,
+    scn_level,
+    soil_ph,
+    fdx,
+    fdx_level,
+    rdx,
+    yield_kgha
+  ) %>%
+  tidyr::drop_na() %>%
+  dplyr::rename(
+    "F. virguliforme" = ratio_fvfg_dnang,
+    "Fv level"        = fv_level,
+    "SCN density"     = scn_count_rep,
+    "SCN level"       = scn_level,
+    "Soil pH"         = soil_ph,
+    "FDX"             = fdx,
+    "FDX level"       = fdx_level,
+    "RDX"             = rdx,
+    "Yield"           = yield_kgha
+  )
+
+var_names_core <- names(corr_vars_core)
+
+corr_df_core <- build_assoc_df(corr_vars_core, var_names_core) %>%
+  flag_validation_pairs()
+
+top_labels_core <- tibble::tibble(
+  label = var_names_core[-1],                  # drop F. virguliforme
+  x = seq_along(var_names_core)[-1],
+  y = length(var_names_core) + 0.78
+)
+
+core_diag_labels <- tibble::tribble(
+  ~label,              ~x, ~y,  ~hjust, ~vjust,
+  "F. virguliforme",    0,  9,   0.25,   0.25,
+  "Fv level",           2,  8,   0.50,   0.50,
+  "SCN density",        3,  7,   0.75,   0.50,
+  "SCN level",          4,  6,   0.75,   0.50,
+  "Soil pH",            5,  5,   0.50,   0.50,
+  "FDX",                6,  4,   0.50,   0.50,
+  "FDX level",          7,  3,   0.75,   0.50,
+  "RDX",                8,  2,   0.50,   0.50,
+  #"Yield",              9,  1,   0.50,   0.50
+)
+
+p_corr_core <- plot_assoc_matrix_gg(
+  df_assoc = corr_df_core,
+  var_names = var_names_core,
+  title_text = "Heterogeneous association matrix of core biological variables",
+  fill_title = "Association",
+  show_type_codes = SHOW_TYPE_CODES_CORE,
+  highlight_validation_pairs = HIGHLIGHT_VALIDATION_PAIRS,
+  x_limits = c(-1.10, length(var_names_core) + 0.95),
+  y_limits = c(0.2, length(var_names_core) + 1.10),
+  value_size = 3.8,
+  type_size  = 2.5,
+  star_size  = 3.1
+) +
+  geom_text(
+    data = core_diag_labels,
+    aes(x = x, y = y, label = label, hjust = hjust, vjust = vjust),
+    inherit.aes = FALSE,
+    size = 3.0,
+    color = "black"
+  ) +
+  geom_text(
+    data = top_labels_core,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    angle = 45,
+    hjust = 0,
+    vjust = 0,
+    size = 3.0
+  )
+
+ggsave(
+  "fig_corr_matrix_core_validation.png",
+  p_corr_core,
+  width = 8.8,
+  height = 7.5,
+  dpi = 300
+)
+
+#========================================================
+# 2. FULL MATRIX
+#========================================================
+corr_vars_full <- df_corr %>%
+  dplyr::select(
+    ratio_fvfg_dnang,
+    fv_level,
+    scn_count_rep,
+    scn_level,
+    soil_ph,
+    fdx,
+    fdx_level,
+    rdx,
+    yield_kgha,
+    sds_tol,
+    product
+  ) %>%
+  tidyr::drop_na() %>%
+  dplyr::rename(
+    "F. virguliforme" = ratio_fvfg_dnang,
+    "Fv level"        = fv_level,
+    "SCN density"     = scn_count_rep,
+    "SCN level"       = scn_level,
+    "Soil pH"         = soil_ph,
+    "FDX"             = fdx,
+    "FDX level"       = fdx_level,
+    "RDX"             = rdx,
+    "Yield"           = yield_kgha,
+    "SDS tolerance"   = sds_tol,
+    "Seed treatment"  = product
+  )
+
+var_names_full <- names(corr_vars_full)
+
+corr_df_full <- build_assoc_df(corr_vars_full, var_names_full) %>%
+  flag_validation_pairs()
+
+top_labels_full <- tibble::tibble(
+  label = var_names_full[-1],                  # drop F. virguliforme
+  x = seq_along(var_names_full)[-1],
+  y = length(var_names_full) + 0.78
+)
+
+full_diag_labels <- tibble::tribble(
+  ~label,              ~x, ~y,  ~hjust, ~vjust,
+  "F. virguliforme",    0, 11,   0.10,   0.25,
+  "Fv level",           2, 10,   0.50,   0.50,
+  "SCN density",        3,  9,   0.75,   0.50,
+  "SCN level",          4,  8,   0.75,   0.50,
+  "Soil pH",            5,  7,   0.50,   0.50,
+  "FDX",                6,  6,   0.50,   0.50,
+  "FDX level",          7,  5,   0.75,   0.50,
+  "RDX",                8,  4,   0.50,   0.50,
+  "Yield",              9,  3,   0.50,   0.50,
+  "SDS tolerance",     10,  2,   0.75,   0.50
+  # Seed treatment intentionally omitted from diagonal labels
+)
+
+p_corr_full <- plot_assoc_matrix_gg(
+  df_assoc = corr_df_full,
+  var_names = var_names_full,
+  title_text = "Mixed-type association matrix with validation pairs",
+  fill_title = "Association",
+  show_type_codes = SHOW_TYPE_CODES_FULL,
+  highlight_validation_pairs = HIGHLIGHT_VALIDATION_PAIRS,
+  x_limits = c(-1.30, length(var_names_full) + 1.10),
+  y_limits = c(0.2, length(var_names_full) + 1.15),
+  value_size = 3.8,
+  type_size  = 2.5,
+  star_size  = 3.1
+) +
+  geom_text(
+    data = full_diag_labels,
+    aes(x = x, y = y, label = label, hjust = hjust, vjust = vjust),
+    inherit.aes = FALSE,
+    size = 3.0,
+    color = "black"
+  ) +
+  geom_text(
+    data = top_labels_full,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    angle = 45,
+    hjust = 0,
+    vjust = 0,
+    size = 3.0
+  )
+
+ggsave(
+  "fig_corr_matrix_full_validation.png",
+  p_corr_full,
+  width = 11.6,
+  height = 9.8,
+  dpi = 300
+)
+
+
+```
+
+
+###surface response stuff###
+```{r}
+
+library(plotly)
+
+surf_df <- df %>%
+  mutate(
+    fv_log = log10(ratio_fvfg_dnang + 1),
+    scn_log = log10(scn_count_rep + 1),
+    rdx_log1p = log1p(rdx),
+    fdx_log1p = log1p(fdx)
+  )
+
+surf_rdx <- surf_df %>%
+  filter(!is.na(fv_log), !is.na(scn_log), !is.na(rdx_log1p))
+
+surf_fdx <- surf_df %>%
+  filter(!is.na(fv_log), !is.na(scn_log), !is.na(fdx_log1p))
+
+surf_yld <- surf_df %>%
+  filter(!is.na(fv_log), !is.na(scn_log), !is.na(yield_kgha))
+
+mod_rdx <- gam(rdx_log1p ~ s(fv_log, scn_log, k = 20), data = surf_rdx, method = "REML")
+mod_fdx <- gam(fdx_log1p ~ s(fv_log, scn_log, k = 20), data = surf_fdx, method = "REML")
+mod_yld <- gam(yield_kgha ~ s(fv_log, scn_log, k = 20), data = surf_yld, method = "REML")
+
+fv_range  <- range(surf_df$fv_log, na.rm = TRUE)
+scn_range <- range(surf_df$scn_log, na.rm = TRUE)
+
+pred_grid <- expand.grid(
+  fv_log  = seq(fv_range[1], fv_range[2], length.out = 100),
+  scn_log = seq(scn_range[1], scn_range[2], length.out = 100)
+)
+
+pred_rdx <- pred_grid %>%
+  mutate(
+    fit = predict(mod_rdx, newdata = pred_grid, type = "response"),
+    response = exp(fit) - 1,
+    panel = "RDX"
+  )
+
+pred_fdx <- pred_grid %>%
+  mutate(
+    fit = predict(mod_fdx, newdata = pred_grid, type = "response"),
+    response = exp(fit) - 1,
+    panel = "FDX"
+  )
+
+pred_yld <- pred_grid %>%
+  mutate(
+    response = predict(mod_yld, newdata = pred_grid, type = "response"),
+    panel = "Yield (kg ha^-1)"
+  )
+
+surface_panel <- function(pred_dat, obs_dat, zlab) {
+  ggplot(pred_dat, aes(x = fv_log, y = scn_log, z = response)) +
+    geom_raster(aes(fill = response), interpolate = TRUE) +
+    geom_contour(color = "black", alpha = 0.6, bins = 8, linewidth = 0.3) +
+    geom_point(
+      data = obs_dat,
+      aes(x = fv_log, y = scn_log),
+      inherit.aes = FALSE,
+      shape = 21, size = 1.2, stroke = 0.2,
+      fill = alpha("white", 0.5), color = alpha("black", 0.5)
+    ) +
+    labs(
+      x = expression(log[10]~"(F. virguliforme ratio + 1)"),
+      y = expression(log[10]~"(SCN eggs + J2 per 100 cm"^3*" + 1)"),
+      fill = zlab
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position = "right",
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold")
+    )
+}
+
+p_rdx <- surface_panel(pred_rdx, surf_rdx, "RDX") +
+  ggtitle("A. Root disease index (RDX)")
+
+p_fdx <- surface_panel(pred_fdx, surf_fdx, "FDX") +
+  ggtitle("B. Foliar disease index (FDX)")
+
+p_yld <- surface_panel(pred_yld, surf_yld, expression("Yield (kg ha"^-1*")")) +
+  ggtitle("C. Yield")
+
+surface_fig <- p_rdx / p_fdx / p_yld +
+  plot_layout(ncol = 1, guides = "collect")
+
+surface_fig
+
+ggsave(
+  filename = "response_surface_column_figure.png",
+  plot = surface_fig,
+  width = 8,
+  height = 14,
+  dpi = 600
+)
+
+
+# helper to convert long prediction grid to x/y/z for plotly surface
+make_surface_matrix <- function(pred_dat) {
+  x_vals <- sort(unique(pred_dat$fv_log))
+  y_vals <- sort(unique(pred_dat$scn_log))
+  
+  z_mat <- pred_dat %>%
+    arrange(scn_log, fv_log) %>%
+    select(fv_log, scn_log, response) %>%
+    pivot_wider(names_from = fv_log, values_from = response) %>%
+    select(-scn_log) %>%
+    as.matrix()
+  
+  list(x = x_vals, y = y_vals, z = z_mat)
+}
+
+surfmat_rdx <- make_surface_matrix(pred_rdx)
+surfmat_fdx <- make_surface_matrix(pred_fdx)
+surfmat_yld <- make_surface_matrix(pred_yld)
+
+summary(pred_yld$response)
+dim(surfmat_yld$z)
+range(surfmat_yld$z, na.rm = TRUE)
+
+```
+
+
+### soil table for supps ###
+```{r}
+
+#========================================================
+# Supplemental table: joint tests for final selected models
+# Includes model name for traceability
+#========================================================
+
+#--------------------------------------------------------
+# Helper: extract all fixed-effect joint tests from a model
+#--------------------------------------------------------
+extract_joint_tests <- function(model, response_label, model_name) {
+  jt <- as.data.frame(emmeans::joint_tests(model))
+
+  # Normalize column names
+  names(jt) <- tolower(names(jt))
+  names(jt) <- gsub("[[:space:]]+", "_", names(jt))
+  names(jt) <- gsub("\\.", "_", names(jt))
+
+  # Find the term column robustly
+  term_col <- intersect(c("model_term", "term", "name"), names(jt))
+  if (length(term_col) == 0) {
+    stop("Could not find term column in joint_tests() output.")
+  }
+  term_col <- term_col[1]
+
+  # Standardize output
+  jt %>%
+    transmute(
+      Model = model_name,
+      Response = response_label,
+      Term = .data[[term_col]],
+      `Num df` = df1,
+      `Den df` = df2,
+      `F ratio` = f_ratio,
+      `P value raw` = p_value
+    )
+}
+
+#--------------------------------------------------------
+# Extract from models (edit here if you swap models)
+#--------------------------------------------------------
+joint_table <- bind_rows(
+  extract_joint_tests(m_rdx_2,   "RDX",   "m_rdx_2"),
+  extract_joint_tests(m_fdx_2,   "FDX",   "m_fdx_2"),
+  extract_joint_tests(m_yield_1, "Yield (kg ha^-1)", "m_yield_1"),
+  extract_joint_tests(m_yield_2, "Yield (kg ha^-1)", "m_yield_2")
+)
+
+#--------------------------------------------------------
+# Clean up term labels for publication
+#--------------------------------------------------------
+joint_table_fmt <- joint_table %>%
+  mutate(
+    Term = dplyr::case_when(
+      Term == "(confounded)" ~ "(confounded)",
+      Term == "z_log10_fv"   ~ "F. virguliforme DNA abundance",
+      Term == "z_log10_scn"  ~ "SCN density",
+      Term == "z_soil_ph"    ~ "Soil pH",
+      Term == "log1p_fdx"    ~ "Foliar disease index (FDX)",
+      Term == "log1p_rdx"    ~ "Root disease index (RDX)",
+      Term == "product"      ~ "Seed treatment",
+      Term == "sds_tol"      ~ "SDS tolerance",
+      TRUE ~ Term
+    ),
+    `Num df` = round(`Num df`, 0),
+    `Den df` = round(`Den df`, 1),
+    `F ratio` = round(`F ratio`, 2),
+    `P value` = dplyr::case_when(
+      is.na(`P value raw`) ~ "NA",
+      `P value raw` < 0.0001 ~ "<0.0001",
+      TRUE ~ sprintf("%.4f", `P value raw`)
+    ),
+    Sig. = dplyr::case_when(
+      is.na(`P value raw`) ~ "",
+      `P value raw` < 0.001 ~ "***",
+      `P value raw` < 0.01  ~ "**",
+      `P value raw` < 0.05  ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(
+    Model,
+    Response,
+    Term,
+    `Num df`,
+    `Den df`,
+    `F ratio`,
+    `P value`,
+    Sig.
+  )
+
+#--------------------------------------------------------
+# Optional: ordering (kept simple since you're validating)
+#--------------------------------------------------------
+joint_table_fmt <- joint_table_fmt %>%
+  mutate(
+    Response = factor(
+      Response,
+      levels = c("FDX", "RDX", "Yield (kg ha^-1)")
+    )
+  ) %>%
+  arrange(Model, Response) %>%
+  mutate(Response = as.character(Response))
+
+#--------------------------------------------------------
+# View + export
+#--------------------------------------------------------
+joint_table_fmt
+
+readr::write_csv(
+  joint_table_fmt,
+  "supplemental_table_final_model_joint_tests_with_model_names.csv"
+)
+
+```
+
+### EMM table for supps ###
+```{r message=FALSE, warning=FALSE}
+#========================================================
+# Supplemental EMM + CLD + pairwise P-value tables
+#========================================================
+
+#--------------------------------------------------------
+# helper: safe response-scale back-transform for log1p models
+# set transform = "log1p" when needed
+#--------------------------------------------------------
+backtransform_emm <- function(df, transform = c("none", "log1p")) {
+  transform <- match.arg(transform)
+
+  if (transform == "log1p") {
+    df %>%
+      mutate(
+        emmean_bt   = exp(emmean) - 1,
+        lower.CL_bt = exp(lower.CL) - 1,
+        upper.CL_bt = exp(upper.CL) - 1
+      )
+  } else {
+    df %>%
+      mutate(
+        emmean_bt   = emmean,
+        lower.CL_bt = lower.CL,
+        upper.CL_bt = upper.CL
+      )
+  }
+}
+
+#--------------------------------------------------------
+# helper: build joined EMM summary + CLD + pairwise table
+# specs examples:
+#   term = "product"
+#   by   = NULL
+#   adjust = "sidak"
+#--------------------------------------------------------
+make_emm_table <- function(model,
+                           model_name,
+                           response_label,
+                           term,
+                           by = NULL,
+                           adjust = "sidak",
+                           transform = c("none", "log1p"),
+                           digits = 2) {
+
+  transform <- match.arg(transform)
+
+  # EMM object
+  emm <- if (is.null(by)) {
+    emmeans::emmeans(model, specs = as.formula(paste("~", term)))
+  } else {
+    emmeans::emmeans(model, specs = as.formula(paste("~", term, "|", by)))
+  }
+
+  # summary table
+  emm_df <- as.data.frame(summary(emm, infer = c(TRUE, TRUE))) %>%
+    backtransform_emm(transform = transform)
+
+  # CLD letters
+  cld_df <- as.data.frame(
+    multcomp::cld(emm, adjust = adjust, Letters = letters)
+  ) %>%
+    mutate(.group = str_trim(.group))
+
+  # pairwise comparisons with exact adjusted p-values
+  pair_df <- as.data.frame(
+    summary(pairs(emm, adjust = adjust), infer = c(TRUE, TRUE))
+  )
+
+  # join CLD to EMM table
+  join_cols <- intersect(names(emm_df), names(cld_df))
+  emm_out <- emm_df %>%
+    left_join(
+      cld_df %>% select(all_of(join_cols), .group),
+      by = join_cols
+    ) %>%
+    mutate(
+      Model = model_name,
+      Response = response_label,
+      Term = term,
+      By = ifelse(is.null(by), NA_character_, by),
+      emmean_bt   = round(emmean_bt, digits),
+      lower.CL_bt = round(lower.CL_bt, digits),
+      upper.CL_bt = round(upper.CL_bt, digits)
+    )
+
+  # format p-values in pairwise table
+  pair_out <- pair_df %>%
+    mutate(
+      Model = model_name,
+      Response = response_label,
+      Term = term,
+      By = ifelse(is.null(by), NA_character_, by),
+      p.value_fmt = case_when(
+        is.na(p.value) ~ "NA",
+        p.value < 0.0001 ~ "<0.0001",
+        TRUE ~ sprintf("%.4f", p.value)
+      )
+    )
+
+  list(
+    emm = emm_out,
+    pairs = pair_out
+  )
+}
+
+#========================================================
+# EXAMPLES: build targeted tables
+# Edit these model calls as needed
+#========================================================
+
+#-----------------------------
+# RDX
+#-----------------------------
+rdx_product <- make_emm_table(
+  model = m_rdx_2,
+  model_name = "m_rdx_2",
+  response_label = "RDX",
+  term = "product",
+  adjust = "sidak",
+  transform = "log1p"
+)
+
+rdx_tol <- make_emm_table(
+  model = m_rdx_2,
+  model_name = "m_rdx_2",
+  response_label = "RDX",
+  term = "sds_tol",
+  adjust = "sidak",
+  transform = "log1p"
+)
+
+# only use this if the interaction is in the model and you want sliced results
+rdx_product_by_tol <- make_emm_table(
+   model = m_rdx_2,
+   model_name = "m_rdx_2",
+   response_label = "RDX",
+   term = "product",
+   by = "sds_tol",
+   adjust = "sidak",
+   transform = "log1p"
+ )
+
+#-----------------------------
+# FDX
+#-----------------------------
+fdx_product <- make_emm_table(
+  model = m_fdx_2,
+  model_name = "m_fdx_2",
+  response_label = "FDX",
+  term = "product",
+  adjust = "sidak",
+  transform = "log1p"
+)
+
+fdx_tol <- make_emm_table(
+  model = m_fdx_2,
+  model_name = "m_fdx_2",
+  response_label = "FDX",
+  term = "sds_tol",
+  adjust = "sidak",
+  transform = "log1p"
+)
+
+# only use this if the interaction is in the model and you want sliced results
+fdx_product_by_tol <- make_emm_table(
+   model = m_fdx_2,
+   model_name = "m_fdx_2",
+   response_label = "FDX",
+   term = "product",
+   by = "sds_tol",
+   adjust = "sidak",
+   transform = "log1p"
+ )
+
+#-----------------------------
+# Yield
+#-----------------------------
+yield1_product <- make_emm_table(
+  model = m_yield_1,
+  model_name = "m_yield_1",
+  response_label = "Yield (with disease indices)",
+  term = "product",
+  adjust = "sidak",
+  transform = "none"
+)
+
+yield1_tol <- make_emm_table(
+  model = m_yield_1,
+  model_name = "m_yield_1",
+  response_label = "Yield (with disease indices)",
+  term = "sds_tol",
+  adjust = "sidak",
+  transform = "none"
+)
+
+# use this if the interaction is in the model and you want the actionable slices
+yield1_product_by_tol <- make_emm_table(
+  model = m_yield_1,
+  model_name = "m_yield_1",
+  response_label = "Yield (with disease indices)",
+  term = "product",
+  by = "sds_tol",
+  adjust = "sidak",
+  transform = "none"
+)
+
+yield2_product <- make_emm_table(
+  model = m_yield_2,
+  model_name = "m_yield_2",
+  response_label = "Yield (without disease indices)",
+  term = "product",
+  adjust = "sidak",
+  transform = "none"
+)
+
+yield2_tol <- make_emm_table(
+  model = m_yield_2,
+  model_name = "m_yield_2",
+  response_label = "Yield (without disease indices)",
+  term = "sds_tol",
+  adjust = "sidak",
+  transform = "none"
+)
+
+# use this if the interaction is in the model and you want the actionable slices
+yield2_product_by_tol <- make_emm_table(
+  model = m_yield_2,
+  model_name = "m_yield_2",
+  response_label = "Yield (without disease indices)",
+  term = "product",
+  by = "sds_tol",
+  adjust = "sidak",
+  transform = "none"
+)
+
+#========================================================
+# bind outputs
+#========================================================
+
+emm_summary_table <- bind_rows(
+  rdx_product$emm,
+  rdx_tol$emm,
+  rdx_product_by_tol$emm,
+  fdx_product$emm,
+  fdx_tol$emm,
+  fdx_product_by_tol$emm,
+  yield1_product$emm,
+  yield1_tol$emm,
+  yield1_product_by_tol$emm,
+  yield2_product$emm,
+  yield2_tol$emm,
+  yield2_product_by_tol$emm
+)
+
+pairwise_p_table <- bind_rows(
+  rdx_product$pairs,
+  rdx_tol$pairs,
+  rdx_product_by_tol$pairs,
+  fdx_product$pairs,
+  fdx_tol$pairs,
+  fdx_product_by_tol$pairs,
+  yield1_product$pairs,
+  yield1_tol$pairs,
+  yield1_product_by_tol$pairs,
+  yield2_product$pairs,
+  yield2_tol$pairs,
+  yield2_product_by_tol$pairs
+)
+
+#========================================================
+# optional cleanup for Word export
+#========================================================
+
+emm_summary_table_fmt <- emm_summary_table %>%
+  mutate(
+    across(any_of(c("product", "sds_tol")), as.character),
+    CLD = .group
+  ) %>%
+  select(
+    Model, Response, Term, By,
+    any_of(c("product", "sds_tol")),
+    emmean_bt, lower.CL_bt, upper.CL_bt, CLD
+  )
+
+pairwise_p_table_fmt <- pairwise_p_table %>%
+  mutate(
+    contrast = as.character(contrast)
+  ) %>%
+  select(
+    Model, Response, Term, By, contrast, estimate, SE, df, t.ratio, p.value_fmt
+  )
+
+#========================================================
+# export
+#========================================================
+
+readr::write_csv(
+  emm_summary_table_fmt,
+  "supplemental_emm_summary_with_cld.csv"
+)
+
+readr::write_csv(
+  pairwise_p_table_fmt,
+  "supplemental_emm_pairwise_pvalues.csv"
+)
+```
+
+
+### surface response plots by product ###
+```{r warning=FALSE}
+library(plotly)
+
+
+product_levels <- c("Base", "ILEVO", "Saltro")
+# If needed, use:
+# product_levels <- c("CB", "ILEVO", "Saltro")
+
+surf_df <- df %>%
+  mutate(
+    fv_log    = log10(ratio_fvfg_dnang + 1),
+    scn_log   = log10(scn_count_rep + 1),
+    rdx_log1p = log1p(rdx),
+    fdx_log1p = log1p(fdx)
+  ) %>%
+  filter(product %in% product_levels)
+
+range_x <- range(surf_df$fv_log, na.rm = TRUE)
+range_y <- range(surf_df$scn_log, na.rm = TRUE)
+
+pred_grid <- expand.grid(
+  fv_log  = seq(range_x[1], range_x[2], length.out = 100),
+  scn_log = seq(range_y[1], range_y[2], length.out = 100)
+)
+
+fit_product_surface <- function(dat, response) {
+  if (response == "RDX") {
+    dat_use <- dat %>% filter(!is.na(rdx_log1p), !is.na(fv_log), !is.na(scn_log))
+    mod <- gam(rdx_log1p ~ s(fv_log, scn_log, k = 20), data = dat_use, method = "REML")
+    pred <- pred_grid %>%
+      mutate(
+        fit = predict(mod, newdata = pred_grid, type = "response"),
+        response = exp(fit) - 1
+      )
+  } else if (response == "FDX") {
+    dat_use <- dat %>% filter(!is.na(fdx_log1p), !is.na(fv_log), !is.na(scn_log))
+    mod <- gam(fdx_log1p ~ s(fv_log, scn_log, k = 20), data = dat_use, method = "REML")
+    pred <- pred_grid %>%
+      mutate(
+        fit = predict(mod, newdata = pred_grid, type = "response"),
+        response = exp(fit) - 1
+      )
+  } else if (response == "Yield") {
+    dat_use <- dat %>% filter(!is.na(yield_kgha), !is.na(fv_log), !is.na(scn_log))
+    mod <- gam(yield_kgha ~ s(fv_log, scn_log, k = 20), data = dat_use, method = "REML")
+    pred <- pred_grid %>%
+      mutate(
+        response = predict(mod, newdata = pred_grid, type = "response")
+      )
+  } else {
+    stop("response must be one of: RDX, FDX, Yield")
+  }
+
+  list(model = mod, pred = pred, obs = dat_use)
+}
+
+make_surface_matrix <- function(pred_dat) {
+  x_vals <- sort(unique(pred_dat$fv_log))
+  y_vals <- sort(unique(pred_dat$scn_log))
+
+  z_mat <- pred_dat %>%
+    arrange(scn_log, fv_log) %>%
+    select(scn_log, fv_log, response) %>%
+    pivot_wider(names_from = fv_log, values_from = response) %>%
+    select(-scn_log) %>%
+    as.matrix()
+
+  list(x = x_vals, y = y_vals, z = z_mat)
+}
+
+fits <- list()
+
+for (p in product_levels) {
+  dat_p <- surf_df %>% filter(product == p)
+
+  fits[[paste0("RDX_", p)]]   <- fit_product_surface(dat_p, "RDX")
+  fits[[paste0("FDX_", p)]]   <- fit_product_surface(dat_p, "FDX")
+  fits[[paste0("Yield_", p)]] <- fit_product_surface(dat_p, "Yield")
+}
+
+surfaces <- list()
+
+for (nm in names(fits)) {
+  surfaces[[nm]] <- make_surface_matrix(fits[[nm]]$pred)
+}
+
+zlim_rdx <- range(unlist(lapply(product_levels, function(p) surfaces[[paste0("RDX_", p)]]$z)), na.rm = TRUE)
+zlim_fdx <- range(unlist(lapply(product_levels, function(p) surfaces[[paste0("FDX_", p)]]$z)), na.rm = TRUE)
+zlim_yld <- range(unlist(lapply(product_levels, function(p) surfaces[[paste0("Yield_", p)]]$z)), na.rm = TRUE)
+
+zlim_yld[1] <- max(0, zlim_yld[1] - 300)
+
+```
+
+#yeh
+```{r}
+
+camera_eye <- list(x = 1.25, y = 1, z = 1.75) #sets camera eye globally and assigns it to a list
+
+scene_common <- function(ztitle, range_x, range_y, zlim) {
+  list(
+    xaxis = list(
+      title = list(text = "log10(F. virguliforme (fg•ng))", font = list(size = 12)),
+      tickfont = list(size = 12),
+      range = range_x,
+      showbackground = TRUE,
+      backgroundcolor = "white",
+      gridcolor = "gray20",
+      zerolinecolor = "black"
+    ),
+    yaxis = list(
+      title = list(text = "log10(SCN eggs + J2s)", font = list(size = 12)),
+      tickfont = list(size = 12),
+      range = range_y,
+      showbackground = TRUE,
+      backgroundcolor = "white",
+      gridcolor = "gray20",
+      zerolinecolor = "black"
+    ),
+    zaxis = list(
+      title = list(text = ztitle, font = list(size = 12)),
+      tickfont = list(size = 12),
+      range = zlim,
+      showbackground = TRUE,
+      backgroundcolor = "white",
+      gridcolor = "gray20",
+      zerolinecolor = "black"
+    ),
+    camera = camera_eye,
+    aspectratio = list(x = 1, y = 1, z = 0.75)
+  )
+}
+
+make_surface_plot <- function(surfmat, obs_dat, ztitle, zlim, range_x, range_y,
+                              colorscale = "Viridis",
+                              show_scale = FALSE,
+                              opacity = 0.30,
+                              mesh_color = "gray30",
+                              mesh_width = 0.25,
+                              point_color = "black",
+                              point_size = 1.2,
+                              point_frac = 0.35,
+                              show_points = TRUE) {
+
+  z_floor <- zlim[1] - 0.05 * diff(zlim)
+
+  p <- plot_ly() %>%
+    add_surface(
+      x = surfmat$x,
+      y = surfmat$y,
+      z = surfmat$z,
+      colorscale = colorscale,
+      showscale = show_scale,
+      showpoints = show_points,
+      opacity = opacity,
+      contours = list(
+        x = list(show = TRUE, color = mesh_color, width = mesh_width, start = min(range_x),
+        end = max(range_x),
+        size = diff(range_x) / 20),
+        y = list(show = TRUE, color = mesh_color, width = mesh_width, start = min(range_y),
+        end = max(range_y),
+        size = diff(range_y) / 20),
+        z = list(show = FALSE)
+      ),
+      hovertemplate = paste0(
+        "log10(Fv): %{x:.2f}<br>",
+        "log10(SCN): %{y:.2f}<br>",
+        ztitle, ": %{z:.2f}<extra></extra>"
+      )
+    )
+
+  if (show_points) {
+    obs_use <- obs_dat %>% sample_frac(min(1, point_frac))
+    p <- p %>%
+      add_markers(
+        data = obs_use,
+        x = ~fv_log,
+        y = ~scn_log,
+        z = rep(z_floor, nrow(obs_use)),
+        marker = list(
+          size = point_size,
+          color = point_color,
+          opacity = 0.40,
+          symbol = "circle"
+        ),
+        inherit = TRUE,
+        hovertemplate = paste0(
+          "Observed<br>",
+          "log10(Fv): %{x:.2f}<br>",
+          "log10(SCN): %{y:.2f}<extra></extra>"
+        ),
+        showlegend = FALSE
+      )
+  }
+
+  p %>%
+    layout(
+      font = list(size = 12),
+      margin = list(l = 0, r = 0, b = 0, t = 0),
+      scene = scene_common(ztitle, range_x, range_y, zlim)
+      )
+}
+```
+
+#uh huh
+```{r}
+fig_rdx_base <- make_surface_plot(
+  surfmat = surfaces[["RDX_Base"]],
+  obs_dat = fits[["RDX_Base"]]$obs,
+  ztitle = "Root disease index (RDX)",
+  zlim = zlim_rdx,
+  range_x = range_x,
+  range_y = range_y,
+)
+
+fig_rdx_ilevo <- make_surface_plot(
+  surfmat = surfaces[["RDX_ILEVO"]],
+  obs_dat = fits[["RDX_ILEVO"]]$obs,
+  ztitle = "Root disease index (RDX)",
+  zlim = zlim_rdx,
+  range_x = range_x,
+  range_y = range_y
+)
+
+fig_rdx_saltro <- make_surface_plot(
+  surfmat = surfaces[["RDX_Saltro"]],
+  obs_dat = fits[["RDX_Saltro"]]$obs,
+  ztitle = "Root disease index (RDX)",
+  zlim = zlim_rdx,
+  range_x = range_x,
+  range_y = range_y
+)
+
+fig_fdx_base <- make_surface_plot(
+  surfmat = surfaces[["FDX_Base"]],
+  obs_dat = fits[["FDX_Base"]]$obs,
+  ztitle = "Foliar disease index (FDX)",
+  zlim = zlim_fdx,
+  range_x = range_x,
+  range_y = range_y
+)
+
+fig_fdx_ilevo <- make_surface_plot(
+  surfmat = surfaces[["FDX_ILEVO"]],
+  obs_dat = fits[["FDX_ILEVO"]]$obs,
+  ztitle = "Foliar disease index (FDX)",
+  zlim = zlim_fdx,
+  range_x = range_x,
+  range_y = range_y
+)
+
+fig_fdx_saltro <- make_surface_plot(
+  surfmat = surfaces[["FDX_Saltro"]],
+  obs_dat = fits[["FDX_Saltro"]]$obs,
+  ztitle = "Foliar disease index (FDX)",
+  zlim = zlim_fdx,
+  range_x = range_x,
+  range_y = range_y
+)
+
+fig_yld_base <- make_surface_plot(
+  surfmat = surfaces[["Yield_Base"]],
+  obs_dat = fits[["Yield_Base"]]$obs,
+  ztitle = "Soybean yield (kg•hectare)",
+  zlim = zlim_yld,
+  range_x = range_x,
+  range_y = range_y
+)
+
+fig_yld_ilevo <- make_surface_plot(
+  surfmat = surfaces[["Yield_ILEVO"]],
+  obs_dat = fits[["Yield_ILEVO"]]$obs,
+  ztitle = "Soybean yield (kg•hectare)",
+  zlim = zlim_yld,
+  range_x = range_x,
+  range_y = range_y
+)
+
+fig_yld_saltro <- make_surface_plot(
+  surfmat = surfaces[["Yield_Saltro"]],
+  obs_dat = fits[["Yield_Saltro"]]$obs,
+  ztitle = "Soybean yield (kg•hectare)",
+  zlim = zlim_yld,
+  range_x = range_x,
+  range_y = range_y
+)
+```
+
+#yupper
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+#saveWidget(fig_rdx_base,   "panel_rdx_base.html",   selfcontained = TRUE)
+#saveWidget(fig_rdx_ilevo,  "panel_rdx_ilevo.html",  selfcontained = TRUE)
+#saveWidget(fig_rdx_saltro, "panel_rdx_saltro.html", selfcontained = TRUE)
+
+#saveWidget(fig_fdx_base,   "panel_fdx_base.html",   selfcontained = TRUE)
+#saveWidget(fig_fdx_ilevo,  "panel_fdx_ilevo.html",  selfcontained = TRUE)
+#saveWidget(fig_fdx_saltro, "panel_fdx_saltro.html", selfcontained = TRUE)
+
+#saveWidget(fig_yld_base,   "panel_yld_base.html",   selfcontained = TRUE)
+#saveWidget(fig_yld_ilevo,  "panel_yld_ilevo.html",  selfcontained = TRUE)
+#saveWidget(fig_yld_saltro, "panel_yld_saltro.html", selfcontained = TRUE)
+
+```
+
+#ok
+```{r message=FALSE, warning=FALSE}
+#install.packages("webshot2")
+#webshot2::install_phantomjs()
+
+library(webshot2)
+
+save_plotly_png <- function(fig, file, width = 600, height = 500, zoom = 3) {
+  
+  tmp_html <- tempfile(fileext = ".html")
+  
+  htmlwidgets::saveWidget(fig, tmp_html, selfcontained = TRUE)
+  
+  webshot2::webshot(
+    url = tmp_html,
+    file = file,
+    vwidth = width,
+    vheight = height,
+    zoom = zoom
+  )
+}
+
+save_plotly_png(fig_rdx_base,   "panel_rdx_base.png")
+save_plotly_png(fig_rdx_ilevo,  "panel_rdx_ilevo.png")
+save_plotly_png(fig_rdx_saltro, "panel_rdx_saltro.png")
+
+save_plotly_png(fig_fdx_base,   "panel_fdx_base.png")
+save_plotly_png(fig_fdx_ilevo,  "panel_fdx_ilevo.png")
+save_plotly_png(fig_fdx_saltro, "panel_fdx_saltro.png")
+
+save_plotly_png(fig_yld_base,   "panel_yld_base.png")
+save_plotly_png(fig_yld_ilevo,  "panel_yld_ilevo.png")
+save_plotly_png(fig_yld_saltro, "panel_yld_saltro.png")
+```
+
+
+
+#yah
+```{r}
+library(cowplot)
+library(magick)
+
+label_panel <- function(path, lab,
+                        x = -0.1, y = 0.8,
+                        size = 12) {
+  ggdraw() +
+    draw_image(path) +
+    draw_label(
+      lab,
+      x = x, y = y,
+      hjust = 0, vjust = 0,
+      fontface = "bold",
+      size = size
+    )
+}
+
+p1 <- label_panel("panel_rdx_base.png",   "A1")
+p2 <- label_panel("panel_rdx_ilevo.png",  "A2")
+p3 <- label_panel("panel_rdx_saltro.png", "A3")
+
+p4 <- label_panel("panel_fdx_base.png",   "B1")
+p5 <- label_panel("panel_fdx_ilevo.png",  "B2")
+p6 <- label_panel("panel_fdx_saltro.png", "B3")
+
+p7 <- label_panel("panel_yld_base.png",   "C1")
+p8 <- label_panel("panel_yld_ilevo.png",  "C2")
+p9 <- label_panel("panel_yld_saltro.png", "C3")
+
+
+row1 <- plot_grid(p1, p2, p3, ncol = 3, align = "hv", axis = "tblr")
+row2 <- plot_grid(p4, p5, p6, ncol = 3, align = "hv", axis = "tblr")
+row3 <- plot_grid(p7, p8, p9, ncol = 3, align = "hv", axis = "tblr")
+
+col_titles <- plot_grid(
+  ggdraw() + draw_label("Commercial Base (CB)", fontface = "bold", size = 12,y=-0.8),
+  ggdraw() + draw_label("CB + fluopyram", fontface = "bold", size = 12,y=-0.8),
+  ggdraw() + draw_label("CB + pydiflumetofen", fontface = "bold", size = 12,y=-0.8),
+  ncol = 3
+)
+
+row1 <- plot_grid(p1, p2, p3, ncol = 3, align = "hv")
+row2 <- plot_grid(p4, p5, p6, ncol = 3, align = "hv")
+row3 <- plot_grid(p7, p8, p9, ncol = 3, align = "hv")
+
+body <- plot_grid(
+  ggdraw() + draw_label("Root disease", angle = 90, fontface = "bold", size = 12),
+  row1,
+  ggdraw() + draw_label("Foliar disease", angle = 90, fontface = "bold", size = 12),
+  row2,
+  ggdraw() + draw_label("Yield", angle = 90, fontface = "bold", size = 12),
+  row3,
+  ncol = 2,
+  rel_widths = c(0.06, 1),
+  rel_heights = c(1, 0.7, 1, 0.9, 1, 0.9)  # equal, no padding bias
+)
+
+final_fig <- plot_grid(
+  NULL, col_titles,
+  NULL, body,
+  ncol = 2,
+  rel_widths = c(0.06, 1),
+  rel_heights = c(0.035, 1)
+)
+
+ggsave("figure_9panel_products.png", final_fig, width = 12, height = 12, dpi = 600)
+```
+
+
+#### ROI code for summaries ####
+```{r include=FALSE}
+
+#========================================================
+# Decision-scenario yield and ROI extraction
+# Risk class × product × SDS tolerance decision model
+#========================================================
+
+#-----------------------------
+# User settings
+#-----------------------------
+treatment_cost_usd_ha <- 32
+price_usd_kg <- 0.45
+
+#-----------------------------
+# Helpers
+#-----------------------------
+standardize_product <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+
+  dplyr::case_when(
+    x %in% c("Base", "CB", "Commercial Base", "Commercial base", "Commercial base (CB)") ~ "Base",
+    stringr::str_detect(x, stringr::regex("ILEVO|fluopyram", ignore_case = TRUE)) ~ "ILEVO",
+    stringr::str_detect(x, stringr::regex("Saltro|pydiflumetofen", ignore_case = TRUE)) ~ "Saltro",
+    TRUE ~ x
+  )
+}
+
+align_factor_to_model <- function(x, model, varname) {
+  mf <- model.frame(model)
+
+  if (varname %in% names(mf) && is.factor(mf[[varname]])) {
+    factor(as.character(x), levels = levels(mf[[varname]]))
+  } else {
+    x
+  }
+}
+
+get_center <- function(x) mean(x, na.rm = TRUE)
+get_scale  <- function(x) sd(x, na.rm = TRUE)
+
+#-----------------------------
+# 1. Build risk classes in model dataframe
+#-----------------------------
+df <- df_yield_mod %>%
+  mutate(
+    product = factor(
+      standardize_product(product),
+      levels = c("Base", "ILEVO", "Saltro")
+    ),
+    sds_tol = factor(sds_tol),
+
+    fv_level = case_when(
+      ratio_fvfg_dnang == 0 ~ "0",
+      ratio_fvfg_dnang > 0 & ratio_fvfg_dnang < 1 ~ "0-1",
+      ratio_fvfg_dnang >= 1 & ratio_fvfg_dnang < 3 ~ "1-3",
+      ratio_fvfg_dnang >= 3 & ratio_fvfg_dnang < 5 ~ "3-5",
+      ratio_fvfg_dnang >= 5 ~ ">5",
+      TRUE ~ NA_character_
+    ),
+    fv_level = factor(
+      fv_level,
+      levels = c("0", "0-1", "1-3", "3-5", ">5"),
+      ordered = TRUE
+    ),
+
+    scn_level = case_when(
+      scn_count_rep == 0 ~ "None",
+      scn_count_rep < 2000 ~ "Low",
+      scn_count_rep >= 2000 ~ "High",
+      TRUE ~ NA_character_
+    ),
+    scn_level = factor(
+      scn_level,
+      levels = c("None", "Low", "High"),
+      ordered = TRUE
+    ),
+
+    fdx_level = case_when(
+      fdx == 0 ~ "None",
+      fdx > 0 & fdx < 10 ~ "Low",
+      fdx >= 10 ~ "High",
+      TRUE ~ NA_character_
+    ),
+    fdx_level = factor(
+      fdx_level,
+      levels = c("None", "Low", "High"),
+      ordered = TRUE
+    ),
+
+    risk_class = interaction(fv_level, scn_level, drop = TRUE),
+    risk_class = droplevels(factor(risk_class))
+  ) %>%
+  filter(
+    !is.na(product),
+    !is.na(sds_tol),
+    !is.na(risk_class),
+    !is.na(yield_kgha),
+    !is.na(z_soil_ph),
+    !is.na(siteyear),
+    !is.na(exp_siteyear)
+  )
+
+#-----------------------------
+# 2. Fit decision model
+#-----------------------------
+m_yield_decision <- lmer(
+  yield_kgha ~
+    product * risk_class +
+    product * sds_tol +
+    z_soil_ph +
+    (1 | siteyear) +
+    (1 | exp_siteyear),
+  data = df,
+  REML = FALSE,
+  control = lmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 200000)
+  )
+)
+
+#emmeans::joint_tests(m_yield_decision)
+
+#-----------------------------
+# 3. Cell support diagnostics
+#-----------------------------
+cell_support <- df %>%
+  count(risk_class, sds_tol, product, name = "n") %>%
+  arrange(risk_class, sds_tol, product)
+
+supported_cells <- cell_support %>%
+  group_by(risk_class, sds_tol) %>%
+  summarise(
+    n_products = n_distinct(product),
+    min_n = min(n),
+    total_n = sum(n),
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_products == 3,
+    min_n >= 3,
+    total_n >= 12
+  )
+
+unsupported_pairs <- cell_support %>%
+  group_by(risk_class, sds_tol) %>%
+  summarise(
+    n_products = n_distinct(product),
+    min_n = min(n),
+    total_n = sum(n),
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_products < 3 | min_n < 3 | total_n < 12
+  )
+
+valid_keys <- supported_cells %>%
+  select(risk_class, sds_tol)
+
+#-----------------------------
+# 4. EMMs and pairwise contrasts
+#-----------------------------
+emm_decision <- emmeans(
+  m_yield_decision,
+  ~ product | risk_class * sds_tol
+)
+
+pairs_decision <- pairs(
+  emm_decision,
+  adjust = "tukey"
+)
+
+pairs_decision_df <- as.data.frame(pairs_decision) %>%
+  filter(!is.na(p.value)) %>%
+  mutate(
+    sig = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+pairs_clean <- pairs_decision_df %>%
+  semi_join(valid_keys, by = c("risk_class", "sds_tol"))
+
+pairs_decision_sig <- pairs_clean %>%
+  filter(p.value < 0.05)
+
+#-----------------------------
+# 5. Scaling constants for decision scenarios
+#-----------------------------
+df_scale <- df %>%
+  mutate(
+    fv_log = log10(ratio_fvfg_dnang + 1),
+    scn_log = log10(scn_count_rep + 1)
+  )
+
+fv_center  <- get_center(df_scale$fv_log)
+fv_scale   <- get_scale(df_scale$fv_log)
+scn_center <- get_center(df_scale$scn_log)
+scn_scale  <- get_scale(df_scale$scn_log)
+ph_center  <- get_center(df_scale$soil_ph)
+ph_scale   <- get_scale(df_scale$soil_ph)
+
+model_risk_levels <- levels(model.frame(m_yield_decision)$risk_class)
+
+
+model_risk_levels
+
+#-----------------------------
+# 6. Scenario addresses
+#-----------------------------
+decision_scenarios <- tibble::tribble(
+  ~scenario,                         ~fv_fg_ng, ~scn_eggs_j2_100cc, ~fdx, ~rdx, ~soil_ph,
+  "No detectable risk",               0.0,       0,                  0,    0,    ph_center,
+  "Fv 0-1 / No SCN / No FDX",          0.5,       0,                  0,    0,    ph_center,
+  "Fv 1-3 / Low SCN / Low FDX",        2.0,       1000,               5,    5,    ph_center,
+  "Fv 3-5 / High SCN / Low FDX",       4.0,       3000,               5,    10,   ph_center,
+  "Fv >5 / Low SCN / No FDX",          6.0,       1000,               0,    5,    ph_center,
+  "Fv >5 / High SCN / High FDX",       6.0,       3000,               10,   15,   ph_center
+) %>%
+  mutate(
+    fv_log = log10(fv_fg_ng + 1),
+    scn_log = log10(scn_eggs_j2_100cc + 1),
+
+    z_log10_fv  = (fv_log - fv_center) / fv_scale,
+    z_log10_scn = (scn_log - scn_center) / scn_scale,
+    z_soil_ph   = (soil_ph - ph_center) / ph_scale,
+
+    log1p_fdx = log1p(fdx),
+    log1p_rdx = log1p(rdx),
+
+    fv_level = case_when(
+      fv_fg_ng == 0 ~ "0",
+      fv_fg_ng > 0 & fv_fg_ng < 1 ~ "0-1",
+      fv_fg_ng >= 1 & fv_fg_ng < 3 ~ "1-3",
+      fv_fg_ng >= 3 & fv_fg_ng < 5 ~ "3-5",
+      fv_fg_ng >= 5 ~ ">5",
+      TRUE ~ NA_character_
+    ),
+    fv_level = factor(
+      fv_level,
+      levels = c("0", "0-1", "1-3", "3-5", ">5"),
+      ordered = TRUE
+    ),
+
+    scn_level = case_when(
+      scn_eggs_j2_100cc == 0 ~ "None",
+      scn_eggs_j2_100cc < 2000 ~ "Low",
+      scn_eggs_j2_100cc >= 2000 ~ "High",
+      TRUE ~ NA_character_
+    ),
+    scn_level = factor(
+      scn_level,
+      levels = c("None", "Low", "High"),
+      ordered = TRUE
+    ),
+
+    fdx_level = case_when(
+      fdx == 0 ~ "None",
+      fdx > 0 & fdx < 10 ~ "Low",
+      fdx >= 10 ~ "High",
+      TRUE ~ NA_character_
+    ),
+    fdx_level = factor(
+      fdx_level,
+      levels = c("None", "Low", "High"),
+      ordered = TRUE
+    ),
+
+    risk_class = interaction(fv_level, scn_level, drop = TRUE)
+  )
+
+# Align scenario risk classes to model-supported levels
+model_risk_levels <- levels(model.frame(m_yield_decision)$risk_class)
+
+decision_scenarios_check <- decision_scenarios %>%
+  mutate(
+    risk_class_chr = as.character(risk_class),
+    in_model = risk_class_chr %in% model_risk_levels
+  ) %>%
+  select(scenario, fv_level, scn_level, risk_class_chr, in_model)
+
+decision_scenarios_check
+
+model_risk_levels
+
+#-----------------------------
+# 7. Product × tolerance prediction grid
+#-----------------------------
+product_levels_decision <- levels(model.frame(m_yield_decision)$product)
+sds_tol_levels_decision <- levels(model.frame(m_yield_decision)$sds_tol)
+
+decision_grid <- tidyr::crossing(
+  decision_scenarios,
+  product = product_levels_decision,
+  sds_tol = sds_tol_levels_decision
+)
+
+#-----------------------------
+# 8. Predict from decision model
+#-----------------------------
+predict_decision_model <- function(model, model_name, newdat) {
+
+  nd <- newdat %>%
+    mutate(
+      product = align_factor_to_model(product, model, "product"),
+      sds_tol = align_factor_to_model(sds_tol, model, "sds_tol"),
+      risk_class = align_factor_to_model(risk_class, model, "risk_class")
+    )
+
+  nd$pred_yield_kgha <- as.numeric(
+    predict(model, newdata = nd, re.form = NA, allow.new.levels = TRUE)
+  )
+
+  nd %>% mutate(model = model_name)
+}
+
+yield_models <- list(
+  m_yield_decision = m_yield_decision
+)
+
+decision_predictions <- purrr::imap_dfr(
+  yield_models,
+  ~ predict_decision_model(.x, .y, decision_grid)
+)
+
+#-----------------------------
+# 9. ROI calculation
+#-----------------------------
+decision_roi <- decision_predictions %>%
+  group_by(model, risk_class, scenario, sds_tol) %>%
+  mutate(
+    base_yield_kgha = pred_yield_kgha[as.character(product) == "Base"][1],
+    delta_yield_kgha = pred_yield_kgha - base_yield_kgha,
+    incremental_cost_usd_ha = if_else(as.character(product) == "Base", 0, treatment_cost_usd_ha),
+    gross_return_usd_ha = delta_yield_kgha * price_usd_kg,
+    net_return_usd_ha = gross_return_usd_ha - incremental_cost_usd_ha,
+    break_even_kgha = treatment_cost_usd_ha / price_usd_kg,
+    roi_status = case_when(
+      as.character(product) == "Base" ~ "Reference",
+      net_return_usd_ha > 0 ~ "Positive ROI",
+      net_return_usd_ha <= 0 ~ "Negative/neutral ROI",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ungroup()
+
+decision_roi_summary_fmt <- decision_roi %>%
+  select(
+    model, scenario, risk_class,
+    fv_level, scn_level, fdx_level,
+    fv_fg_ng, scn_eggs_j2_100cc, fdx, rdx, soil_ph,
+    sds_tol, product,
+    pred_yield_kgha,
+    delta_yield_kgha,
+    gross_return_usd_ha,
+    incremental_cost_usd_ha,
+    net_return_usd_ha,
+    break_even_kgha,
+    roi_status
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+roi_clean <- decision_roi_summary_fmt %>%
+  semi_join(valid_keys, by = c("risk_class", "sds_tol"))
+
+#-----------------------------
+# 10. Export
+#-----------------------------
+output_dir <- "decision_scenario_outputs"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+utils::write.csv(
+  decision_roi_summary_fmt,
+  file.path(output_dir, "decision_scenario_yield_roi_summary_with_cb.csv"),
+  row.names = FALSE
+)
+
+utils::write.csv(
+  roi_clean,
+  file.path(output_dir, "decision_scenario_yield_roi_supported_only.csv"),
+  row.names = FALSE
+)
+
+utils::write.csv(
+  pairs_clean,
+  file.path(output_dir, "decision_scenario_pairwise_supported_only.csv"),
+  row.names = FALSE
+)
+
+utils::write.csv(
+  pairs_decision_sig,
+  file.path(output_dir, "decision_scenario_pairwise_significant.csv"),
+  row.names = FALSE
+)
+
+utils::write.csv(
+  cell_support,
+  file.path(output_dir, "decision_scenario_cell_support.csv"),
+  row.names = FALSE
+)
+
+utils::write.csv(
+  unsupported_pairs,
+  file.path(output_dir, "decision_scenario_unsupported_pairs.csv"),
+  row.names = FALSE
+)
+
+#-----------------------------
+# 11. Print key outputs
+#-----------------------------
+supported_cells
+unsupported_pairs
+roi_clean
+pairs_clean
+pairs_decision_sig
+
+
+```
+
+### ROI plot and tables ###
+```{r}
+
+#========================================================
+# Main figure + supplemental table for decision ROI results
+# Requires existing objects:
+#   decision_roi_summary_fmt
+#   pairs_clean
+#   pairs_decision_sig
+#========================================================
+
+#-----------------------------
+# 1. Clean and order ROI table robustly
+#-----------------------------
+
+emm_df <- as.data.frame(emm_decision)
+
+decision_roi_summary_fmt <- emm_df %>%
+  group_by(risk_class, sds_tol) %>%
+  mutate(
+    base_yield_kgha = emmean[as.character(product) == "Base"][1],
+    delta_yield_kgha = emmean - base_yield_kgha,
+    incremental_cost_usd_ha = if_else(as.character(product) == "Base", 0, treatment_cost_usd_ha),
+    gross_return_usd_ha = delta_yield_kgha * price_usd_kg,
+    net_return_usd_ha = gross_return_usd_ha - incremental_cost_usd_ha,
+    break_even_kgha = treatment_cost_usd_ha / price_usd_kg,
+    roi_status = case_when(
+      as.character(product) == "Base" ~ "Reference",
+      net_return_usd_ha > 0 ~ "Positive ROI",
+      net_return_usd_ha <= 0 ~ "Negative/neutral ROI",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+decision_roi_summary_fmt
+
+# Inspect actual levels first
+unique(decision_roi_summary_fmt$risk_class)
+unique(decision_roi_summary_fmt$product)
+unique(decision_roi_summary_fmt$sds_tol)
+
+risk_order <- decision_roi_summary_fmt %>%
+  dplyr::mutate(risk_class = as.character(risk_class)) %>%
+  dplyr::distinct(risk_class) %>%
+  dplyr::pull(risk_class)
+
+decision_roi_summary_fmt %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    products = paste(unique(as.character(product)), collapse = " | "),
+    sds_tols = paste(unique(as.character(sds_tol)), collapse = " | "),
+    risk_classes = paste(unique(as.character(risk_class)), collapse = " | ")
+  )
+
+roi_plot_df <- decision_roi_summary_fmt %>%
+  dplyr::mutate(
+    risk_class = as.character(risk_class),
+    product_raw = as.character(product),
+    sds_tol_raw = as.character(sds_tol),
+
+    product_clean = dplyr::case_when(
+      stringr::str_detect(product_raw, stringr::regex("base|CB$", ignore_case = TRUE)) ~ "Base",
+      stringr::str_detect(product_raw, stringr::regex("ILEVO|fluopyram", ignore_case = TRUE)) ~ "CB + fluopyram",
+      stringr::str_detect(product_raw, stringr::regex("Saltro|pydiflumetofen", ignore_case = TRUE)) ~ "CB + pydiflumetofen",
+      TRUE ~ product_raw
+    ),
+
+    sds_tol_clean = dplyr::case_when(
+      sds_tol_raw %in% c("r", "R", "resistant", "Resistant") ~ "Moderately resistant cultivar",
+      sds_tol_raw %in% c("s", "S", "susceptible", "Susceptible") ~ "Susceptible cultivar",
+      TRUE ~ sds_tol_raw
+    )
+  ) %>%
+  dplyr::filter(product_clean != "Base") %>%
+  dplyr::mutate(
+    risk_class = factor(risk_class, levels = unique(risk_class)),
+    product = factor(
+      product_clean,
+      levels = c("CB + fluopyram", "CB + pydiflumetofen")
+    ),
+    sds_tol = factor(
+      sds_tol_clean,
+      levels = c("Moderately resistant cultivar", "Susceptible cultivar")
+    )
+  ) %>%
+  dplyr::filter(!is.na(product), !is.na(sds_tol), !is.na(risk_class))
+
+# Check before plotting
+nrow(roi_plot_df)
+dplyr::count(roi_plot_df, risk_class, sds_tol, product)
+
+if (nrow(roi_plot_df) == 0) {
+  stop("roi_plot_df is empty. Check product, sds_tol, and risk_class labels.")
+}
+
+#-----------------------------
+# 2. Add significance flags
+#-----------------------------
+sig_flags <- pairs_decision_sig %>%
+  dplyr::mutate(
+    risk_class = as.character(risk_class),
+    sds_tol = factor(
+      as.character(sds_tol),
+      levels = c("r", "s"),
+      labels = c("Moderately resistant cultivar", "Susceptible cultivar")
+    ),
+    contrast = as.character(contrast),
+    sig_label = dplyr::case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  dplyr::filter(stringr::str_detect(contrast, "Saltro")) %>%
+  dplyr::group_by(risk_class, sds_tol) %>%
+  dplyr::summarise(
+    sig_label = paste(unique(sig_label), collapse = ""),
+    .groups = "drop"
+  )
+
+roi_plot_df <- roi_plot_df %>%
+  dplyr::left_join(sig_flags, by = c("risk_class", "sds_tol")) %>%
+  dplyr::mutate(
+    highlight = dplyr::if_else(
+      as.character(product) == "CB + pydiflumetofen" &
+        !is.na(sig_label) &
+        sig_label != "",
+      TRUE,
+      FALSE
+    )
+  )
+
+#-----------------------------
+# 3. Break-even threshold
+#-----------------------------
+break_even_kgha <- roi_plot_df %>%
+  dplyr::filter(!is.na(break_even_kgha)) %>%
+  dplyr::summarise(x = dplyr::first(break_even_kgha)) %>%
+  dplyr::pull(x)
+
+#-----------------------------
+# 4. Main figure
+#-----------------------------
+p_decision_window <- ggplot(
+  roi_plot_df,
+  aes(
+    x = risk_class,
+    y = delta_yield_kgha,
+    color = product,
+    group = product
+  )
+) +
+  geom_hline(yintercept = 0, linewidth = 0.35) +
+  geom_hline(yintercept = break_even_kgha, linewidth = 0.45, linetype = "dashed") +
+  geom_line(linewidth = 0.6, alpha = 0.65, position = position_dodge(width = 0.35)) +
+  geom_point(
+    aes(shape = highlight),
+    size = 3,
+    stroke = 0.8,
+    position = position_dodge(width = 0.35)
+  ) +
+  geom_text(
+    data = roi_plot_df %>% dplyr::filter(highlight),
+    aes(label = sig_label),
+    vjust = -1.0,
+    size = 4,
+    show.legend = FALSE,
+    position = position_dodge(width = 0.35)
+  ) +
+  facet_wrap(~ sds_tol, ncol = 1) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17), guide = "none") +
+  labs(
+    title = "Decision window for SDHI seed treatment yield response",
+    x = "Pre-plant pathogen-defined risk level",
+    y = expression(Delta*"yield relative to CB (kg "*ha^{-1}*")"),
+    color = "Seed treatment"
+  ) +
+  annotate(
+    "text",
+    x = Inf,
+    y = break_even_kgha,
+    label = paste0("Break-even = ", round(break_even_kgha, 0), " kg ha\u207B\u00B9"),
+    hjust = 1.05,
+    vjust = -0.6,
+    size = 3.2
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "top",
+    legend.title = element_text(face = "bold")
+  )
+
+p_decision_window
+
+ggsave(
+  "fig_decision_window_delta_yield.png",
+  p_decision_window,
+  width = 9,
+  height = 7,
+  dpi = 600
+)
+
+#-----------------------------
+# 5. Supplemental table with ROI and significance context
+#-----------------------------
+pairwise_sig_table <- pairs_clean %>%
+  mutate(
+    risk_class = as.character(risk_class),
+    sds_tol = as.character(sds_tol),
+    contrast = as.character(contrast),
+    p_fmt = case_when(
+      p.value < 0.0001 ~ "<0.0001",
+      TRUE ~ sprintf("%.4f", p.value)
+    )
+  ) %>%
+  select(
+    risk_class,
+    sds_tol,
+    contrast,
+    estimate,
+    SE,
+    df,
+    t.ratio,
+    p.value,
+    p_fmt,
+    sig
+  )
+
+roi_table_supp <- decision_roi_summary_fmt %>%
+  mutate(
+    risk_class = as.character(risk_class),
+    sds_tol = as.character(sds_tol),
+    product = as.character(product),
+    roi_status = as.character(roi_status),
+    p_value_note = case_when(
+      risk_class == "3-5.Low" &
+        product == "Saltro" ~ "Significant yield advantage for Saltro in pairwise contrasts",
+      TRUE ~ ""
+    )
+  ) %>%
+  arrange(
+    factor(risk_class, levels = risk_order),
+    sds_tol,
+    factor(product, levels = c("Base", "ILEVO", "Saltro"))
+  )
+
+#-----------------------------
+# 6. Export supplemental tables
+#-----------------------------
+output_dir <- "decision_scenario_outputs"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+write_csv(
+  roi_table_supp,
+  file.path(output_dir, "supplemental_table_decision_roi_full.csv")
+)
+
+write_csv(
+  pairwise_sig_table,
+  file.path(output_dir, "supplemental_table_decision_pairwise_contrasts.csv")
+)
+
+#-----------------------------
+# 7. Optional compact table for manuscript text
+#-----------------------------
+decision_window_summary <- roi_table_supp %>%
+  dplyr::mutate(
+    risk_class_chr = as.character(risk_class),
+    product_chr = as.character(product)
+  ) %>%
+  dplyr::filter(
+    risk_class_chr == "3-5.Low",
+    stringr::str_detect(
+      product_chr,
+      stringr::regex("Base|CB|ILEVO|fluopyram|Saltro|pydiflumetofen", ignore_case = TRUE)
+    )
+  ) %>%
+  dplyr::select(
+    risk_class,
+    sds_tol,
+    product,
+    emmean,                 # <-- FIXED
+    delta_yield_kgha,
+    net_return_usd_ha,
+    roi_status
+  )
+
+readr::write_csv(
+  decision_window_summary,
+  file.path(output_dir, "main_text_decision_window_summary.csv")
+)
+
+decision_window_summary <- decision_window_summary %>%
+  dplyr::rename(
+    predicted_yield_kgha = emmean
+  )
+
+decision_window_summary
+
+
+```
+
+### freezes analysis state ###
+```{r}
+cache_dir <- file.path(getwd(), "cache")
+
+if (!dir.exists(cache_dir)) {
+  dir.create(cache_dir, recursive = TRUE)
+}
+
+saveRDS(m_yield_decision, file.path(cache_dir, "m_yield_decision.rds"))
+saveRDS(decision_roi_summary_fmt, file.path(cache_dir, "roi_summary.rds"))
+saveRDS(pairs_decision_sig, file.path(cache_dir, "pairs_sig.rds"))
+```
+
+
+### plotz ###
+```{r}
+
+m_yield_decision <- readRDS(file.path(cache_dir, "m_yield_decision.rds"))
+decision_roi_summary_fmt <- readRDS(file.path(cache_dir, "roi_summary.rds"))
+pairs_decision_sig <- readRDS(file.path(cache_dir, "pairs_sig.rds"))
+
+#========================================================
+# Main figure: predicted yield by collapsed SDS risk level
+#========================================================
+
+mean_price_usd_kg <- 0.43
+break_even_kgha <- 71
+
+#-----------------------------
+# Choose predicted yield column
+#-----------------------------
+yield_col <- dplyr::case_when(
+  "predicted_yield_kgha" %in% names(decision_roi_summary_fmt) ~ "predicted_yield_kgha",
+  "pred_yield_kgha" %in% names(decision_roi_summary_fmt) ~ "pred_yield_kgha",
+  "emmean" %in% names(decision_roi_summary_fmt) ~ "emmean",
+  TRUE ~ NA_character_
+)
+
+#-----------------------------
+# Build plotting dataframe
+#-----------------------------
+#-----------------------------
+# Build plotting dataframe
+#-----------------------------
+fig_yield_df <- decision_roi_summary_fmt %>%
+  mutate(
+    pred_yield_kgha = .data[[yield_col]],
+    risk_class = as.character(risk_class),
+    product = as.character(product),
+    sds_tol = as.character(sds_tol),
+
+    fv_bin = stringr::str_extract(risk_class, "^[^.]+"),
+    scn_bin = stringr::str_extract(risk_class, "(?<=\\.).+$"),
+
+    risk_level = case_when(
+      fv_bin %in% c("0", "0-1") & scn_bin %in% c("None", "Low") ~ "Low",
+      fv_bin %in% c("1-3", "3-5") & scn_bin %in% c("None", "Low") ~ "Moderate",
+      fv_bin == ">5" | scn_bin == "High" ~ "High",
+      TRUE ~ NA_character_
+    ),
+
+    risk_level = factor(risk_level, levels = c("Low", "Moderate", "High")),
+
+    sds_tol = case_when(
+      sds_tol %in% c("r", "R") ~ "Moderately resistant cultivars (R)",
+      sds_tol %in% c("s", "S") ~ "Susceptible cultivars (S)",
+      TRUE ~ sds_tol
+    ),
+
+    product = case_when(
+      stringr::str_detect(product, "Base") ~ "CB",
+      stringr::str_detect(product, "ILEVO") ~ "CB + fluopyram",
+      stringr::str_detect(product, "Saltro") ~ "CB + pydiflumetofen",
+      TRUE ~ product
+    ),
+
+    product = factor(
+      product,
+      levels = c("CB", "CB + fluopyram", "CB + pydiflumetofen")
+    )
+  ) %>%
+  filter(!is.na(risk_level))
+
+#-----------------------------
+# Mean ± SE
+#-----------------------------
+fig_yield_sum <- fig_yield_df %>%
+  group_by(risk_level, sds_tol, product) %>%
+  summarise(
+    mean_yield = mean(pred_yield_kgha),
+    se_yield = sd(pred_yield_kgha) / sqrt(n()),
+    .groups = "drop"
+  )
+
+#-----------------------------
+# Break-even shading (below threshold)
+#-----------------------------
+break_even_df <- fig_yield_sum %>%
+  filter(product == "CB") %>%
+  mutate(
+    break_even_yield = mean_yield + break_even_kgha,
+    xnum = as.numeric(risk_level),
+    xmin = xnum - 0.48,
+    xmax = xnum + 0.48,
+    ymin = -Inf,
+    ymax = break_even_yield
+  )
+
+#-----------------------------
+# Brackets with ordering + spacing
+#-----------------------------
+product_offsets <- tibble::tribble(
+  ~product, ~x_offset,
+  "CB", -0.27,
+  "CB + fluopyram", 0,
+  "CB + pydiflumetofen", 0.27
+)
+
+sig_brackets <- pairs_decision_sig %>%
+  mutate(
+    risk_class = as.character(risk_class),
+    sds_tol = case_when(
+      as.character(sds_tol) %in% c("r", "R") ~ "Moderately resistant cultivars (R)",
+      as.character(sds_tol) %in% c("s", "S") ~ "Susceptible cultivars (S)",
+      TRUE ~ as.character(sds_tol)
+    ),
+    product_1 = case_when(
+      str_detect(contrast, "Base - Saltro") ~ "CB",
+      str_detect(contrast, "ILEVO - Saltro") ~ "CB + fluopyram"
+    ),
+    product_2 = "CB + pydiflumetofen",
+
+    bracket_order = case_when(
+      str_detect(contrast, "ILEVO - Saltro") ~ 1,
+      str_detect(contrast, "Base - Saltro") ~ 2
+    ),
+
+    p_label = paste0("italic(P) == ", signif(p.value, 1))
+  ) %>%
+  filter(risk_class == "3-5.Low") %>%
+  left_join(product_offsets, by = c("product_1" = "product")) %>%
+  rename(x1_offset = x_offset) %>%
+  left_join(product_offsets, by = c("product_2" = "product")) %>%
+  rename(x2_offset = x_offset)
+
+ymax_df <- fig_yield_df %>%
+  group_by(sds_tol) %>%
+  summarise(ymax = max(pred_yield_kgha), .groups = "drop")
+
+sig_brackets <- sig_brackets %>%
+  left_join(ymax_df, by = "sds_tol") %>%
+  group_by(sds_tol) %>%
+  arrange(bracket_order) %>%
+  mutate(
+    x_base = 2,
+    x1 = x_base + x1_offset,
+    x2 = x_base + x2_offset,
+    y = ymax + 140 + 160 * (bracket_order - 1),
+    y_tick = y - 40,
+    label_y = y + 40
+  ) %>%
+  ungroup()
+
+#-----------------------------
+# Plot
+#-----------------------------
+p_yield_main <- ggplot(fig_yield_df,
+  aes(x = risk_level, y = pred_yield_kgha, fill = product)
+) +
+  geom_rect(
+    data = break_even_df,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE,
+    fill = "grey50",
+    alpha = 0.1
+  ) +
+  geom_boxplot(
+    position = position_dodge(0.8),
+    width = 0.6,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    shape = 21,
+    aes(fill = product),
+    color = "black",
+    stroke = 0.3,
+    position = position_jitterdodge(0.08, 0.8),
+    alpha = 0.7,
+    size = 2
+  ) +
+  # brackets
+  geom_segment(data = sig_brackets,
+    aes(x = x1, xend = x2, y = y, yend = y),
+    inherit.aes = FALSE
+  ) +
+  geom_segment(data = sig_brackets,
+    aes(x = x1, xend = x1, y = y_tick, yend = y),
+    inherit.aes = FALSE
+  ) +
+  geom_segment(data = sig_brackets,
+    aes(x = x2, xend = x2, y = y_tick, yend = y),
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = sig_brackets,
+    aes(x = (x1 + x2)/2, y = label_y, label = p_label),
+    parse = TRUE,
+    size = 3.2,
+    inherit.aes = FALSE
+  ) +
+
+  facet_wrap(~ sds_tol, ncol = 1) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    x = "Soybean sudden death syndrome (SDS) risk level",
+    y = expression("Predicted soybean yield (kg "*ha^{-1}*")"),
+    fill = "Seed treatment"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold", margin = margin(t = 10)),
+    axis.title.y = element_text(face = "bold", margin = margin(r = 10)),
+    axis.text = element_text(color = "black"),
+    plot.margin = margin(t = 8, r = 8, b = 18, l = 8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p_yield_main
+
+#========================================================
+# Export outputs
+#========================================================
+
+#-----------------------------
+# Define output directory safely
+#-----------------------------
+output_dir <- file.path(getwd(), "figure_outputs")
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+#-----------------------------
+# Save main figure
+#-----------------------------
+ggsave(
+  filename = file.path(output_dir, "Fig_main_predicted_yield_collapsed_risk.png"),
+  plot = p_yield_main,
+  width = 7.5,
+  height = 8.5,
+  dpi = 600
+)
+
+# Optional vector version for journal submission
+ggsave(
+  filename = file.path(output_dir, "Fig_main_predicted_yield_collapsed_risk.pdf"),
+  plot = p_yield_main,
+  width = 7.5,
+  height = 8.5
+)
+
+#-----------------------------
+# Export summary data (useful for supplement / reproducibility)
+#-----------------------------
+write.csv(
+  fig_yield_sum,
+  file = file.path(output_dir, "Fig_main_summary_means_SE.csv"),
+  row.names = FALSE
+)
+
+# Optional: export bracket stats
+write.csv(
+  sig_brackets,
+  file = file.path(output_dir, "Fig_main_significance_brackets.csv"),
+  row.names = FALSE
+)
+
+saveRDS(p_yield_main, file.path(output_dir, "Fig_main_plot_object.rds"))
+
+```
+
+### supp table? ###
+```{r}
+
+#-----------------------------
+# Detect correct yield column
+#-----------------------------
+yield_col <- case_when(
+  "predicted_yield_kgha" %in% names(decision_roi_summary_fmt) ~ "predicted_yield_kgha",
+  "pred_yield_kgha" %in% names(decision_roi_summary_fmt) ~ "pred_yield_kgha",
+  "emmean" %in% names(decision_roi_summary_fmt) ~ "emmean",
+  TRUE ~ NA_character_
+)
+
+#-----------------------------
+# Build table
+#-----------------------------
+decision_table <- decision_roi_summary_fmt %>%
+  mutate(
+    pred_yield_kgha = .data[[yield_col]],
+    risk_class = as.character(risk_class),
+
+    sds_tol = case_when(
+      sds_tol %in% c("r", "R") ~ "Moderately resistant",
+      sds_tol %in% c("s", "S") ~ "Susceptible",
+      TRUE ~ as.character(sds_tol)
+    ),
+
+    product = case_when(
+      str_detect(as.character(product), "Base") ~ "CB",
+      str_detect(as.character(product), "ILEVO") ~ "CB + fluopyram",
+      str_detect(as.character(product), "Saltro") ~ "CB + pydiflumetofen",
+      TRUE ~ as.character(product)
+    )
+  ) %>%
+  filter(
+    risk_class %in% c("0.None", "3-5.Low", ">5.High")
+  ) %>%
+  select(
+    risk_class,
+    sds_tol,
+    product,
+    pred_yield_kgha,
+    delta_yield_kgha,
+    net_return_usd_ha,
+    roi_status
+  ) %>%
+  mutate(
+    pred_yield_kgha = round(pred_yield_kgha),
+    delta_yield_kgha = round(delta_yield_kgha),
+    net_return_usd_ha = round(net_return_usd_ha)
+  )
+
+emm_risk <- emmeans(
+  m_yield_decision,
+  ~ product | risk_class * sds_tol
+)
+
+cld_risk <- multcomp::cld(
+  emm_risk,
+  adjust = "tukey",
+  Letters = letters
+) %>%
+  as.data.frame() %>%
+  mutate(
+    risk_class = as.character(risk_class),
+    sds_tol = case_when(
+      sds_tol %in% c("r", "R") ~ "Moderately resistant",
+      sds_tol %in% c("s", "S") ~ "Susceptible",
+      TRUE ~ as.character(sds_tol)
+    ),
+    product = case_when(
+      stringr::str_detect(as.character(product), "Base") ~ "CB",
+      stringr::str_detect(as.character(product), "ILEVO") ~ "CB + fluopyram",
+      stringr::str_detect(as.character(product), "Saltro") ~ "CB + pydiflumetofen",
+      TRUE ~ as.character(product)
+    ),
+    cld = stringr::str_trim(.group)
+  ) %>%
+  select(risk_class, sds_tol, product, cld)
+
+decision_table_cld <- decision_table %>%
+  left_join(cld_risk, by = c("risk_class", "sds_tol", "product"))
+
+decision_table_cld
+
+#-----------------------------
+# Define output directory
+#-----------------------------
+output_dir <- file.path(getwd(), "table_outputs")
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+#-----------------------------
+# Prepare table for export
+#-----------------------------
+decision_table_export <- decision_table_cld %>%
+  mutate(
+    risk_level = case_when(
+      risk_class == "0.None" ~ "Low",
+      risk_class == "3-5.Low" ~ "Moderate",
+      risk_class == ">5.High" ~ "High",
+      TRUE ~ risk_class
+    ),
+    treatment = product
+  ) %>%
+  select(
+    risk_level,
+    sds_tol,
+    treatment,
+    pred_yield_kgha,
+    delta_yield_kgha,
+    net_return_usd_ha,
+    roi_status,
+    cld
+  ) %>%
+  rename(
+    `Risk level` = risk_level,
+    `Cultivar tolerance` = sds_tol,
+    `Treatment` = treatment,
+    `Predicted yield (kg ha^-1)` = pred_yield_kgha,
+    `Δ yield vs CB (kg ha^-1)` = delta_yield_kgha,
+    `Net return (USD ha^-1)` = net_return_usd_ha,
+    `ROI status` = roi_status,
+    `Group` = cld
+  )
+
+#-----------------------------
+# Write CSV
+#-----------------------------
+write.csv(
+  decision_table_export,
+  file = file.path(output_dir, "Supplemental_Table_3_SDHI_ROI.csv"),
+  row.names = FALSE
+)
+
+# optional preview
+decision_table_export
+
+
+```
+
+
+
+# -----------------------------
+# Supplemental Table S1: cultivar deployment by state/province and year
+# -----------------------------
+```{r cultivar-summary-table, eval=FALSE}
+# Purpose:
+#   Generate a reviewer-friendly cultivar deployment table grouped by year and
+#   state/province, with moderately resistant and susceptible cultivars shown
+#   side-by-side. This table supports the Methods and Supplemental Table S1.
+#
+# Output:
+#   tables/Supplemental_Table_Cultivars_by_State_Year.csv
+
+state_lookup <- tibble::tribble(
+  ~state, ~state_full,
+  "DE", "Delaware",
+  "IA", "Iowa",
+  "IL", "Illinois",
+  "IN", "Indiana",
+  "KS", "Kansas",
+  "KY", "Kentucky",
+  "MI", "Michigan",
+  "MO", "Missouri",
+  "ND", "North Dakota",
+  "OH", "Ohio",
+  "ON", "Ontario",
+  "WI", "Wisconsin"
+)
+
+cultivar_table_wide <- df %>%
+  select(state, year, location, cultivar, sds_tol) %>%
+  distinct() %>%
+  mutate(
+    state = trimws(as.character(state)),
+    year = as.integer(as.character(year)),
+    location = trimws(as.character(location)),
+    cultivar = stringr::str_to_upper(trimws(as.character(cultivar))),
+    tol_class = case_when(
+      sds_tol %in% c("r", "R") ~ "moderately resistant (R) cultivar",
+      sds_tol %in% c("s", "S") ~ "susceptible (S) cultivar",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(tol_class), !is.na(cultivar), cultivar != "") %>%
+  group_by(year, state, tol_class) %>%
+  summarise(
+    cultivars = str_c(sort(unique(cultivar)), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = tol_class,
+    values_from = cultivars,
+    values_fill = "-"
+  )
+
+cultivar_counts <- df %>%
+  select(state, year, location, cultivar, sds_tol) %>%
+  distinct() %>%
+  mutate(
+    state = trimws(as.character(state)),
+    year = as.integer(as.character(year)),
+    location = trimws(as.character(location)),
+    cultivar = stringr::str_to_upper(trimws(as.character(cultivar))),
+    sds_tol = trimws(as.character(sds_tol))
+  ) %>%
+  filter(
+    sds_tol %in% c("r", "R", "s", "S"),
+    !is.na(cultivar),
+    cultivar != ""
+  ) %>%
+  group_by(year, state) %>%
+  summarise(
+    n_cultivars = n_distinct(cultivar),
+    n_siteyears = n_distinct(paste(location, year)),
+    .groups = "drop"
+  )
+
+cultivar_table_export <- cultivar_table_wide %>%
+  left_join(cultivar_counts, by = c("year", "state")) %>%
+  left_join(state_lookup, by = "state") %>%
+  mutate(`state/province` = if_else(is.na(state_full), state, state_full)) %>%
+  select(
+    year,
+    `state/province`,
+    `moderately resistant (R) cultivar`,
+    `susceptible (S) cultivar`,
+    n_cultivars,
+    n_siteyears
+  ) %>%
+  arrange(year, `state/province`)
+
+readr::write_csv(
+  cultivar_table_export,
+  file.path(table_dir, "Supplemental_Table_Cultivars_by_State_Year.csv")
+)
+
+cultivar_table_export
+```
+
+
+# -----------------------------
+# Reproducibility record
+# -----------------------------
+```{r session-info}
+# Record package versions and R version used to render the pipeline.
+sessionInfo()
+```
