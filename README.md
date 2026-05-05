@@ -17,7 +17,7 @@ The project integrates molecular diagnostics, mixed-effects modeling, multivaria
 The primary workflow is contained in:
 
 ```text
-sds_risk_ms_pipeline_clean_annotated_bells_whistles.Rmd
+sds_risk_pipeline_RH.Rmd
 ```
 
 This annotated RMarkdown file includes:
